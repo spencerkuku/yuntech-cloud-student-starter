@@ -3,8 +3,6 @@ import argparse
 
 import configparser
 
-import getpass
-
 import hashlib
 
 import io
@@ -128,10 +126,10 @@ def configure():
     account = input("12-digit account ID shown in YOUR Learner Lab console: ").strip()
     if not re.fullmatch(r"\d{12}", account):
         raise LabError("Invalid account ID.")
-    values = {key: getpass.getpass(label + ": ").strip() for key, label in (
-        ("aws_access_key_id", "Access key ID (hidden)"),
-        ("aws_secret_access_key", "Secret access key (hidden)"),
-        ("aws_session_token", "Session token (hidden)"))}
+    values = {key: input(label + ": ").strip() for key, label in (
+        ("aws_access_key_id", "Access key ID"),
+        ("aws_secret_access_key", "Secret access key"),
+        ("aws_session_token", "Session token"))}
     if any(not v or any(ch.isspace() for ch in v) for v in values.values()):
         raise LabError("Paste each VALUE only, without labels, quotes, or whitespace.")
     # Verify before overwriting a working profile. Temporary files stay outside the repository.
