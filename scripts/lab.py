@@ -3,6 +3,8 @@ import argparse
 
 import configparser
 
+import getpass
+
 import hashlib
 
 import io
@@ -126,7 +128,7 @@ def configure():
     account = input("12-digit account ID shown in YOUR Learner Lab console: ").strip()
     if not re.fullmatch(r"\d{12}", account):
         raise LabError("Invalid account ID.")
-    values = {key: input(label + ": ").strip() for key, label in (
+    values = {key: getpass.getpass(label + ": ").strip() for key, label in (
         ("aws_access_key_id", "Access key ID"),
         ("aws_secret_access_key", "Secret access key"),
         ("aws_session_token", "Session token"))}
