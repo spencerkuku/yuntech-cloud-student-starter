@@ -116,14 +116,13 @@ bash "$ROOT_DIR/deploy/make-user-data.sh" "$commit" "$USER_DATA_PATH"
 
 # Import the course-safe AWS environment, created outside the repository.
 EVAL_ENV="$(python3 - "$ROOT_DIR" <<'PY'
-import json
 import os
 import sys
 root = sys.argv[1]
 sys.path.insert(0, root)
-from scripts.lab import context, verify
-ctx = verify()
-print(f"export AWS_PROFILE={ctx['profile'] if 'profile' in ctx else 'learnerlab'}")
+from scripts.lab import context
+ctx = context()
+print(f"export AWS_PROFILE=learnerlab")
 print(f"export AWS_REGION={ctx['region']}")
 print(f"export AWS_DEFAULT_REGION={ctx['region']}")
 print(f"export AWS_SHARED_CREDENTIALS_FILE={os.path.expanduser('~/.aws/credentials')}")
@@ -179,19 +178,34 @@ if [[ -n "$route_table_id" && "$route_table_id" != "None" ]]; then
 fi
 
 # Create the security group with only the learner source CIDR allowed for TCP 22 and 80.
+if sg_id="$(aws ec2 describe-security-groups --filters "Name=group-name,Values=${sg_name}" "Name=vpc-id,Values=${vpc_id}" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)" && [[ -n "$sg_id" && "$sg_id" != "None" ]]; then
+  aws ec2 delete-security-group --group-id "$sg_id" >/dev/null 2>&1 || true
+fi
 sg_id="$(aws ec2 create-security-group --group-name "$sg_name" --description "W3 inspection service" --vpc-id "$vpc_id" --query 'GroupId' --output text)"
 aws ec2 authorize-security-group-ingress --group-id "$sg_id" --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${source_ip}/32}]" "IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp=${source_ip}/32}]"
 
 # Create a dedicated key pair for SSH access, leaving the private key only in the Codespace.
+if aws ec2 describe-key-pairs --key-names "$key_name" --query 'KeyPairs[0].KeyName' --output text 2>/dev/null | grep -q .; then
+  aws ec2 delete-key-pair --key-name "$key_name" >/dev/null 2>&1 || true
+fi
 mkdir -p "${HOME}/.ssh"
 chmod 700 "${HOME}/.ssh"
-ssh-keygen -t ed25519 -N "" -f "${HOME}/.ssh/${key_name}" -q || true
-aws ec2 import-key-pair --key-name "$key_name" --public-key-material "$(cat "${HOME}/.ssh/${key_name}.pub")"
+rm -f "${HOME}/.ssh/${key_name}" "${HOME}/.ssh/${key_name}.pub"
+ssh-keygen -t ed25519 -N "" -f "${HOME}/.ssh/${key_name}" -q
+public_key_path="${HOME}/.ssh/${key_name}.pub"
+if [[ ! -s "$public_key_path" ]]; then
+  echo "Generated SSH public key is missing; cannot import key pair ${key_name}." >&2
+  exit 1
+fi
+aws ec2 import-key-pair --key-name "$key_name" --public-key-material "fileb://${public_key_path}"
 
 # Select the AL2023 x86_64 AMI, at least one public IPv4 address and user data packaging.
 ami_id="$(aws ec2 describe-images \
   --owners amazon \
-  --filters Name=name,Values='al2023-ami-*' Name architecture,Values='x86_64' Name=state,Values='available' \
+  --filters \
+    "Name=name,Values=al2023-ami-*" \
+    "Name=architecture,Values=x86_64" \
+    "Name=state,Values=available" \
   --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text)"
 if [[ -z "$ami_id" || "$ami_id" == "None" ]]; then
   echo "Could not find an AL2023 x86_64 AMI in region ${region}; stop and verify the image selection." >&2
@@ -219,7 +233,8 @@ public_ip="$(printf '%s' "$instance_data" | python3 -c 'import json,sys; data=js
 
 # Record resource IDs so next steps and down.sh only operate on the owned IDs.
 python3 - "$RESOURCES_PATH" "$sg_id" "$key_name" "$instance_id" "$root_volume_id" "$eni_id" <<'PY'
-import json, sys
+import json, os, sys
+from datetime import datetime, timezone
 path = sys.argv[1]
 sg_id, key_name, instance_id, root_volume_id, eni_id = sys.argv[2:7]
 obj = {
@@ -228,11 +243,11 @@ obj = {
     "instance_id": instance_id,
     "root_volume_id": root_volume_id,
     "eni_id": eni_id,
-    "created_at_utc": __import__('datetime').datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+    "created_at_utc": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
     "group": None,
     "owner": None,
 }
-if path.exists():
+if os.path.exists(path):
     try:
         with open(path, 'r', encoding='utf-8') as fh:
             prev = json.load(fh)
