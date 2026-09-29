@@ -22,6 +22,10 @@ FIXTURES = {
 spec = importlib.util.spec_from_file_location("w04_service", ROOT / "app/service.py")
 service = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(service)
+matrix_spec = importlib.util.spec_from_file_location(
+    "w04_rejection_matrix", ROOT / "tests/w04_rejection_matrix.py")
+matrix = importlib.util.module_from_spec(matrix_spec)
+matrix_spec.loader.exec_module(matrix)
 
 
 class EventApiContract(unittest.TestCase):
@@ -186,6 +190,31 @@ class EventApiContract(unittest.TestCase):
         status, error = self.json_request(
             "POST", "/events", body=FIXTURES["valid"], token="reporter-test-token")
         self.assertEqual((status, error["error"]), (403, "forbidden"))
+
+    def test_seven_row_rejection_matrix(self):
+        rows = matrix.run_matrix(
+            self.base, "reporter-test-token", "operator-test-token")
+        self.assertEqual(len(rows), 7)
+        self.assertEqual([row["name"] for row in rows], [
+            "reporter POST #1",
+            "no-token POST",
+            "operator POST",
+            "reporter POST without timezone",
+            "reporter duplicate POST #1",
+            "reporter GET /events",
+            "operator GET /events includes #1",
+        ])
+        self.assertTrue(all(row["passed"] for row in rows), rows)
+
+    def test_matrix_loads_tokens_from_file_without_logging_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / "app.env"
+            env_file.write_text(
+                "REPORTER_TOKEN=reporter-fixture-secret\n"
+                "OPERATOR_TOKEN=operator-fixture-secret\n",
+                encoding="utf-8")
+            tokens = matrix.load_tokens(env_file)
+        self.assertEqual(tokens, ("reporter-fixture-secret", "operator-fixture-secret"))
 
     def test_health_auth_configuration_and_manual_token_page(self):
         status, health = self.json_request("GET", "/health")
