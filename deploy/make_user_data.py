@@ -45,6 +45,7 @@ After=network.target
 [Service]
 Type=simple
 User=inspection
+EnvironmentFile=-/etc/inspection/app.env
 WorkingDirectory=/opt/inspection/app
 ExecStart=/usr/bin/python3 /opt/inspection/app/service.py
 Restart=on-failure
