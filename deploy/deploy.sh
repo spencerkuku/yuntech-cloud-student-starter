@@ -72,17 +72,21 @@ read -r INSTANCE_ID STATE SG_ID <<< "$ROUND_ROW"
 PUBLIC_IP="$(python3 - "$INSTANCE_ID" <<'PY'
 import sys
 sys.path.insert(0, "scripts")
-from lab import run_aws, verify, LabError
+# The identity gate already ran above via scripts/verify-aws.sh. Use context() here,
+# not verify(), because verify() prints a line that would pollute this captured value.
+from lab import run_aws, context, LabError
 try:
-    ctx = verify()
-    data = run_aws(["ec2", "describe-instances", "--instance-ids", sys.argv[1],
-                    "--query", "Reservations[0].Instances[0].{S:State.Name,P:PublicIpAddress}"],
-                   ctx["region"])
-    row = data["Reservations"][0]["Instances"][0]
-except (LabError, KeyError, IndexError) as exc:
+    ctx = context()
+    # --query already projects the response, so the result IS the state/IP pair.
+    row = run_aws(["ec2", "describe-instances", "--instance-ids", sys.argv[1],
+                   "--query", "Reservations[0].Instances[0].{S:State.Name,P:PublicIpAddress}"],
+                  ctx["region"])
+except (LabError, TypeError) as exc:
     sys.exit(f"AWS lookup failed: {exc}")
+if not isinstance(row, dict) or "P" not in row:
+    sys.exit("AWS returned no address for this instance")
 print(row["P"])
-sys.exit(0 if row["S"] == "running" and row["P"] else 3)
+sys.exit(0 if row.get("S") == "running" and row["P"] else 3)
 PY
 )" || die "instance $INSTANCE_ID is not running with a public IPv4; use deploy/up.sh instead."
 
