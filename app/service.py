@@ -175,7 +175,7 @@ document.getElementById("load").addEventListener("click", async () => {
     status.textContent = `${result.events.length} event(s)`;
     for (const event of result.events) {
       const item = document.createElement("li");
-      item.textContent = `${event.event_id} | ${event.device_id} | ${event.observed_at} | ${event.type} | ${event.note || ""}`;
+            item.textContent = `${event.event_id} | ${event.device_id} | ${event.observed_at} | ${event.type} | ${event.received_at} | ${event.note || ""}`;
       list.appendChild(item);
     }
   } catch (_) {

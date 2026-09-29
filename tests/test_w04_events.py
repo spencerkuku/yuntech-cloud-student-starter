@@ -1,5 +1,6 @@
 """Offline W4 event API contract tests using the supplied JSON fixtures."""
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import redirect_stdout
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = ROOT / "tests" / "fixtures"
@@ -192,19 +194,39 @@ class EventApiContract(unittest.TestCase):
         self.assertEqual((status, error["error"]), (403, "forbidden"))
 
     def test_seven_row_rejection_matrix(self):
-        rows = matrix.run_matrix(
-            self.base, "reporter-test-token", "operator-test-token")
-        self.assertEqual(len(rows), 7)
-        self.assertEqual([row["name"] for row in rows], [
-            "reporter POST #1",
-            "no-token POST",
-            "operator POST",
-            "reporter POST without timezone",
-            "reporter duplicate POST #1",
-            "reporter GET /events",
-            "operator GET /events includes #1",
-        ])
-        self.assertTrue(all(row["passed"] for row in rows), rows)
+        reporter_token = "reporter-test-token"
+        operator_token = "operator-test-token"
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / "app.env"
+            env_file.write_text(
+                f"REPORTER_TOKEN={reporter_token}\nOPERATOR_TOKEN={operator_token}\n",
+                encoding="utf-8")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exit_code = matrix.main([
+                    "--base-url", self.base, "--env-file", str(env_file)])
+
+        report = output.getvalue()
+        self.assertEqual(exit_code, 0)
+        lines = report.splitlines()
+        self.assertEqual(lines[0], "Health version: " + "b" * 40)
+        self.assertEqual(len(lines[1:]), 7)
+        self.assertNotIn(reporter_token, report)
+        self.assertNotIn(operator_token, report)
+
+        statuses = [201, 401, 403, 400, 409, 403, 200]
+        bodies = []
+        for number, (line, status) in enumerate(zip(lines[1:], statuses), start=1):
+            prefix = f"{number}. HTTP {status} body="
+            self.assertTrue(line.startswith(prefix), line)
+            bodies.append(json.loads(line[len(prefix):]))
+
+        first_event_id = bodies[0]["event_id"]
+        self.assertTrue(first_event_id.startswith("g02-m4-"))
+        self.assertIn("received_at", bodies[0])
+        self.assertEqual(bodies[3]["field"], "observed_at")
+        self.assertTrue(any(
+            event.get("event_id") == first_event_id for event in bodies[6]["events"]))
 
     def test_matrix_loads_tokens_from_file_without_logging_them(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -215,6 +237,20 @@ class EventApiContract(unittest.TestCase):
                 encoding="utf-8")
             tokens = matrix.load_tokens(env_file)
         self.assertEqual(tokens, ("reporter-fixture-secret", "operator-fixture-secret"))
+
+    def test_matrix_report_redacts_tokens_from_health_and_json_body(self):
+        tokens = ("reporter-fixture-secret", "operator-fixture-secret")
+        result = {
+            "health_version": tokens[0],
+            "rows": [{
+                "number": 1,
+                "status": 200,
+                "body": {tokens[1]: tokens[0]},
+            }],
+        }
+        report = matrix.format_report(result, tokens)
+        self.assertNotIn(tokens[0], report)
+        self.assertNotIn(tokens[1], report)
 
     def test_health_auth_configuration_and_manual_token_page(self):
         status, health = self.json_request("GET", "/health")
@@ -235,6 +271,7 @@ class EventApiContract(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn('type="password"', html)
         self.assertIn("textContent", html)
+        self.assertIn("event.received_at", html)
         self.assertNotIn("innerHTML", html)
         self.assertNotIn("localStorage", html)
         self.assertNotIn("sessionStorage", html)
