@@ -1,0 +1,7 @@
+{
+  "event_id": "g02-cookieI-0002",
+  "device_id": "g02-d01",
+  "observed_at": "2026-09-29T10:05:00",
+  "type": "anomaly",
+  "note": "timestamp has no timezone"
+}
