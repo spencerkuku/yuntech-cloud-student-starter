@@ -9,7 +9,7 @@
 
 ## 1. `/health` 的回應
 
-貼上部署後執行 `curl -s http://<主機現在的公開位址>/health` 的原始輸出：
+貼上部署後執行 `curl -s http://18.208.156.214/health` 的原始輸出：
 
 ```text
 {"status":"ok","service":"inspection","version":"fd06e10fabc1cec79945facdb95fc85b57301ad6","started_at":"2026-09-29T02:52:06Z","auth_configured":true}
