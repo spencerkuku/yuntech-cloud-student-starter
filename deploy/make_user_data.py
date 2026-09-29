@@ -4,9 +4,11 @@ import argparse
 import base64
 import gzip
 import io
+import os
 from pathlib import Path
 import subprocess
 import tarfile
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -71,9 +73,19 @@ def main():
     args = parser.parse_args()
     sha, data = build(args.commit)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("xb") as stream:
-        args.output.chmod(0o600)
-        stream.write(data)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{args.output.name}.", suffix=".tmp", dir=args.output.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, args.output)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
     print(f"Commit: {sha}\nUser data: {len(data)} bytes (<16384); {args.output}")
 
 

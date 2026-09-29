@@ -25,6 +25,10 @@ KEY_NAME="${KEY_NAME:-}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.micro}"
 CREATED_SECURITY_GROUP_ID=""
 IMPORTED_KEY_PAIR_NAME=""
+RESUME_EXISTING_RESOURCES=false
+RESUMED_SECURITY_GROUP_ID=""
+RESUMED_KEY_PAIR_NAME=""
+RESUMED_KEY_PAIR_ID=""
 
 aws_cmd() {
   AWS_PROFILE=learnerlab \
@@ -109,30 +113,178 @@ ensure_aws_ready() {
   python3 "$ROOT_DIR/scripts/lab.py" verify >/dev/null
 }
 
-ensure_no_tracked_resources() {
-  python3 - "$RESOURCES_FILE" <<'PY'
-import json, sys
+load_resource_plan() {
+  local plan_json
+  plan_json="$(python3 - "$RESOURCES_FILE" <<'PY'
+import json, re, sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
-if not path.exists():
-  raise SystemExit(0)
-
-try:
-  items = json.loads(path.read_text(encoding="utf-8"))
-except (OSError, json.JSONDecodeError) as exc:
-  raise SystemExit(f"Cannot safely read resources.json ({type(exc).__name__}); refusing deployment")
+if path.exists():
+  try:
+    items = json.loads(path.read_text(encoding="utf-8"))
+  except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"Cannot safely read resources.json ({type(exc).__name__}); refusing deployment")
+else:
+  items = {}
 
 if not isinstance(items, dict):
   raise SystemExit("resources.json must contain a JSON object; refusing deployment")
 
-tracked_keys = ("security_group_id", "key_pair_name", "instance_id")
-present = [key for key in tracked_keys if items.get(key) not in (None, "")]
-if present:
-  print("resources.json contains recorded or partial resources: " + ", ".join(present), file=sys.stderr)
-  print("Refusing to clear or overwrite the manifest; reconcile these resources before a new deployment.", file=sys.stderr)
-  raise SystemExit(1)
+allowed = {"security_group_id", "key_pair_name", "instance_id"}
+unknown = [key for key, value in items.items() if key not in allowed and value not in (None, "")]
+if unknown:
+  raise SystemExit("resources.json contains unsupported nonempty fields: " + ", ".join(unknown))
+
+def manifest_string(key):
+  value = items.get(key, "")
+  if value is None or value == "":
+    return ""
+  if not isinstance(value, str):
+    raise SystemExit(f"resources.json {key} must be a string; refusing deployment")
+  return value
+
+security_group_id = manifest_string("security_group_id")
+key_pair_name = manifest_string("key_pair_name")
+instance_id = manifest_string("instance_id")
+if instance_id:
+  raise SystemExit("resources.json already records an instance; refusing to create another")
+if security_group_id and not re.fullmatch(r"sg-[a-z0-9]+", str(security_group_id)):
+  raise SystemExit("resources.json security_group_id is invalid; refusing deployment")
+if key_pair_name and not re.fullmatch(r"[A-Za-z0-9+=,.@_-]{1,128}", str(key_pair_name)):
+  raise SystemExit("resources.json key_pair_name is invalid; refusing deployment")
+
+if not security_group_id and not key_pair_name:
+  mode = "fresh"
+elif security_group_id and key_pair_name:
+  mode = "resume"
+else:
+  raise SystemExit("resources.json contains an incomplete resource pair; refusing deployment")
+
+print(json.dumps({"mode": mode, "security_group_id": security_group_id, "key_pair_name": key_pair_name}))
 PY
+  )"
+
+  RESUME_EXISTING_RESOURCES="$(python3 -c 'import json,sys; print("true" if json.loads(sys.argv[1])["mode"] == "resume" else "false")' "$plan_json")"
+  RESUMED_SECURITY_GROUP_ID="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["security_group_id"])' "$plan_json")"
+  RESUMED_KEY_PAIR_NAME="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["key_pair_name"])' "$plan_json")"
+}
+
+verify_resumed_security_group() {
+  local group_json
+  group_json="$(aws_cmd ec2 describe-security-groups --group-ids "$RESUMED_SECURITY_GROUP_ID")"
+
+  python3 - "$group_json" "$RESUMED_SECURITY_GROUP_ID" "$GROUP_NAME" "$VPC_ID" "$SOURCE_CIDR" "$OWNER" <<'PY'
+import json, sys
+
+result = json.loads(sys.argv[1])
+security_group_id, group_name, vpc_id, source_cidr, owner = sys.argv[2:]
+groups = result.get("SecurityGroups", [])
+if len(groups) != 1 or groups[0].get("GroupId") != security_group_id:
+    raise SystemExit("Exact manifest security group ID did not resolve uniquely")
+group = groups[0]
+if group.get("GroupName") != f"{group_name}-sg" or group.get("VpcId") != vpc_id:
+    raise SystemExit("Existing SG GroupName/VpcId do not match deployment configuration")
+
+expected = {(22, 22, source_cidr), (80, 80, source_cidr)}
+observed = []
+for permission in group.get("IpPermissions", []):
+    if permission.get("IpProtocol") != "tcp":
+        raise SystemExit("Existing SG has unexpected non-TCP ingress")
+    if permission.get("Ipv6Ranges") or permission.get("PrefixListIds") or permission.get("UserIdGroupPairs"):
+        raise SystemExit("Existing SG has unexpected non-IPv4 ingress source")
+    ranges = permission.get("IpRanges", [])
+    if len(ranges) != 1 or permission.get("FromPort") != permission.get("ToPort"):
+        raise SystemExit("Existing SG ingress rule shape is unexpected")
+    observed.append((permission.get("FromPort"), permission.get("ToPort"), ranges[0].get("CidrIp")))
+if sorted(observed) != sorted(expected):
+    raise SystemExit("Existing SG ingress does not exactly match TCP 22/80 from SOURCE_CIDR")
+
+tags = {tag.get("Key"): tag.get("Value") for tag in group.get("Tags") or []}
+if tags:
+    required = {"course": "yuntech-115-1", "week": "w03", "group": group_name, "owner": owner}
+    if any(tags.get(key) != value for key, value in required.items()):
+        raise SystemExit("Existing SG tags do not match this course/group/owner")
+else:
+    print("Existing SG has no tags; exact manifest ID plus matching VPC/name/ingress will be used for resume verification.", file=sys.stderr)
+PY
+
+  local eni_json
+  eni_json="$(aws_cmd ec2 describe-network-interfaces --filters "Name=group-id,Values=${RESUMED_SECURITY_GROUP_ID}")"
+  python3 -c 'import json,sys; data=json.loads(sys.argv[1]); n=data.get("NetworkInterfaces", []); (sys.exit("Existing SG is attached to ENIs; refusing resume") if n else None)' "$eni_json"
+
+  local instance_json
+  instance_json="$(aws_cmd ec2 describe-instances --filters "Name=instance.group-id,Values=${RESUMED_SECURITY_GROUP_ID}")"
+  python3 -c 'import json,sys; data=json.loads(sys.argv[1]); n=[i for r in data.get("Reservations", []) for i in r.get("Instances", [])]; (sys.exit("Existing SG is associated with EC2; refusing resume") if n else None)' "$instance_json"
+}
+
+verify_resumed_key_pair() {
+  local expected_key_name="${KEY_NAME:-${GROUP_NAME}-w03-key}"
+  if [ "$RESUMED_KEY_PAIR_NAME" != "$expected_key_name" ]; then
+    echo "resources.json key_pair_name does not match the configured key name; refusing resume." >&2
+    return 1
+  fi
+
+  local private_key_path="$HOME/.ssh/${RESUMED_KEY_PAIR_NAME}"
+  local public_key_path="$HOME/.ssh/${RESUMED_KEY_PAIR_NAME}.pub"
+  if [ ! -f "$private_key_path" ] || [ ! -f "$public_key_path" ]; then
+    echo "Local key-pair files are incomplete; refusing resume." >&2
+    return 1
+  fi
+  local private_key_mode
+  private_key_mode="$(stat -c '%a' "$private_key_path")"
+  if [ "$private_key_mode" != "600" ]; then
+    echo "Local private key permissions must be 600; refusing resume." >&2
+    return 1
+  fi
+
+  local local_fingerprint
+  local_fingerprint="$(ssh-keygen -E sha256 -lf "$public_key_path" | awk 'NR == 1 { sub(/^SHA256:/, "", $2); sub(/=+$/, "", $2); print $2 }')"
+  if [ -z "$local_fingerprint" ]; then
+    echo "Could not calculate local public-key fingerprint; refusing resume." >&2
+    return 1
+  fi
+
+  local key_pair_json
+  key_pair_json="$(aws_cmd ec2 describe-key-pairs --key-names "$RESUMED_KEY_PAIR_NAME")"
+  RESUMED_KEY_PAIR_ID="$(python3 - "$key_pair_json" "$RESUMED_KEY_PAIR_NAME" "$local_fingerprint" "$GROUP_NAME" "$OWNER" <<'PY'
+import json, re, sys
+
+result = json.loads(sys.argv[1])
+key_name, local_fingerprint, group_name, owner = sys.argv[2:]
+pairs = result.get("KeyPairs", [])
+if len(pairs) != 1 or pairs[0].get("KeyName") != key_name:
+    raise SystemExit("Exact key-pair name did not resolve uniquely")
+pair = pairs[0]
+if pair.get("KeyType", "").lower() != "ed25519":
+    raise SystemExit("Existing AWS key pair is not ed25519")
+aws_fingerprint = str(pair.get("KeyFingerprint", "")).removeprefix("SHA256:").rstrip("=")
+if not aws_fingerprint or aws_fingerprint != local_fingerprint:
+    raise SystemExit("AWS key-pair fingerprint does not match the local public key")
+key_pair_id = pair.get("KeyPairId", "")
+if not re.fullmatch(r"key-[a-z0-9]+", key_pair_id):
+    raise SystemExit("AWS did not return a valid key-pair ID")
+tags = {tag.get("Key"): tag.get("Value") for tag in pair.get("Tags") or []}
+if tags:
+    required = {"course": "yuntech-115-1", "week": "w03", "group": group_name, "owner": owner}
+    if any(tags.get(key) != value for key, value in required.items()):
+        raise SystemExit("Existing key-pair tags do not match this course/group/owner")
+print(key_pair_id)
+PY
+  )"
+
+  IMPORTED_KEY_PAIR_NAME="$RESUMED_KEY_PAIR_NAME"
+}
+
+prepare_resource_state() {
+  load_resource_plan
+  if [ "$RESUME_EXISTING_RESOURCES" = true ]; then
+    verify_resumed_security_group
+    verify_resumed_key_pair
+    echo "已唯讀驗證 manifest 中既有 SG 與 key pair；續跑時不會重新建立或匯入。"
+  else
+    echo "resources.json 為空，使用全新部署流程。"
+  fi
 }
 
 resolve_ami() {
@@ -500,8 +652,6 @@ PY
 }
 
 main() {
-  ensure_no_tracked_resources
-
   echo "=== 檢查 AWS 環境 ==="
   ensure_aws_ready
 
@@ -513,15 +663,25 @@ main() {
   require_value SUBNET_ID
 
   validate_source_cidr "$SOURCE_CIDR"
+  prepare_resource_state
   resolve_ami
 
   echo "=== 即將建立的資源清單 ==="
   echo "- VPC: ${VPC_ID}"
   echo "- Subnet: ${SUBNET_ID}"
   echo "- AMI: ${AMI_ID}"
-  echo "- SG: ${GROUP_NAME}-sg"
-  echo "- Key pair: ${KEY_NAME:-${GROUP_NAME}-w03-key}"
-  echo "- EC2: ${INSTANCE_TYPE}, AL2023 x86_64, deployment commit ${DEPLOY_COMMIT}"
+  if [ "$RESUME_EXISTING_RESOURCES" = true ]; then
+    echo "- Reuse existing SG: ${RESUMED_SECURITY_GROUP_ID} (${GROUP_NAME}-sg); ingress TCP 22/80 from ${SOURCE_CIDR}"
+    echo "- Reuse existing key pair: ${RESUMED_KEY_PAIR_NAME} (${RESUMED_KEY_PAIR_ID})"
+  else
+    echo "- Create SG: ${GROUP_NAME}-sg"
+    echo "- Import key pair: ${KEY_NAME:-${GROUP_NAME}-w03-key}"
+  fi
+  echo "- Create exactly one EC2: ${INSTANCE_TYPE}, AL2023 x86_64, deployment commit ${DEPLOY_COMMIT}"
+  echo "- Root EBS: 8 GiB, encrypted gp3, DeleteOnTermination=true"
+  echo "- Metadata: IMDSv2 required"
+  echo "- Network exposure: TCP 22/80 limited to ${SOURCE_CIDR}; inspection listens only on 127.0.0.1:8080"
+  echo "- Cost categories: running t3.micro compute, gp3 root volume, public IPv4; current rates depend on region and AWS pricing"
   echo "- Source /32: ${SOURCE_CIDR}"
   echo "- User data: ${ROOT_DIR}/.local/w03-user-data.sh"
   echo ""
@@ -538,14 +698,19 @@ main() {
   local key_name="${KEY_NAME:-${GROUP_NAME}-w03-key}"
   local user_data_file="${ROOT_DIR}/.local/w03-user-data.sh"
 
-  local sg_id
-  create_security_group "$sg_name" "$VPC_ID"
-  sg_id="$CREATED_SECURITY_GROUP_ID"
-
   local imported_key_name
-  ensure_key_pair "$key_name"
-  imported_key_name="$IMPORTED_KEY_PAIR_NAME"
-  write_resources_json key_pair_name "$imported_key_name"
+  local sg_id
+  if [ "$RESUME_EXISTING_RESOURCES" = true ]; then
+    sg_id="$RESUMED_SECURITY_GROUP_ID"
+    imported_key_name="$RESUMED_KEY_PAIR_NAME"
+  else
+    create_security_group "$sg_name" "$VPC_ID"
+    sg_id="$CREATED_SECURITY_GROUP_ID"
+
+    ensure_key_pair "$key_name"
+    imported_key_name="$IMPORTED_KEY_PAIR_NAME"
+    write_resources_json key_pair_name "$imported_key_name"
+  fi
 
   build_user_data "$DEPLOY_COMMIT" "$user_data_file"
 
