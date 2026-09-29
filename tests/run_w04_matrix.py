@@ -91,9 +91,18 @@ rows.append(("7 Operator GET /events",
 
 expected = [201, 401, 403, 400, 409, 403, 200]
 
+# 取得目前部署版本
+health_status, health_body = request("GET", base + "/health")
+try:
+    health = json.loads(health_body)
+    version = health.get("version", "UNKNOWN")
+except json.JSONDecodeError:
+    version = "UNKNOWN"
+
 print()
 print("W4 rejection matrix")
-print("=" * 68)
+print("version:", version)
+print("=" * 72)
 
 all_ok = True
 
@@ -108,14 +117,24 @@ for i, ((name, status, body), want) in enumerate(zip(rows, expected), 1):
                 event.get("event_id") == valid["event_id"]
                 for event in events
             )
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, AttributeError):
             ok = False
 
     result = "PASS" if ok else "FAIL"
-    print(f"{i}. {name:<38} {status} expected={want}  {result}")
+
+    try:
+        parsed = json.loads(body)
+        display_body = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+    except json.JSONDecodeError:
+        display_body = body.strip()
+
+    print(f"#{i} {name}")
+    print(f"HTTP {status}  expected={want}  {result}")
+    print(f"body: {display_body}")
+    print("-" * 72)
+
     all_ok &= ok
 
-print("=" * 68)
 print("RESULT:", "ALL PASS" if all_ok else "FAILED")
 
 raise SystemExit(0 if all_ok else 1)
