@@ -120,7 +120,9 @@ def main():
     attempt = 1
     while event["event_id"] in already:
         attempt += 1
-        stem, _, _ = template["event_id"].rsplit("-", 1)
+        stem, _, serial = template["event_id"].rpartition("-")
+        if not stem:
+            die(f"fixture event_id {template['event_id']!r} has no <stem>-<serial> shape")
         event["event_id"] = f"{stem}-{attempt:04d}"
     print(f"using event_id: {event['event_id']} (not already on the host)")
     print()
