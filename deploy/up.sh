@@ -24,6 +24,7 @@ AMI_ID="${AMI_ID:-}"
 KEY_NAME="${KEY_NAME:-}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.micro}"
 CREATED_SECURITY_GROUP_ID=""
+IMPORTED_KEY_PAIR_NAME=""
 
 aws_cmd() {
   AWS_PROFILE=learnerlab \
@@ -44,6 +45,8 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 items = json.loads(path.read_text()) if path.exists() else {}
+if not isinstance(items, dict):
+  raise SystemExit("resources.json must contain a JSON object; refusing to overwrite it")
 key = sys.argv[2]
 value = sys.argv[3]
 items[key] = value
@@ -106,6 +109,32 @@ ensure_aws_ready() {
   python3 "$ROOT_DIR/scripts/lab.py" verify >/dev/null
 }
 
+ensure_no_tracked_resources() {
+  python3 - "$RESOURCES_FILE" <<'PY'
+import json, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+  raise SystemExit(0)
+
+try:
+  items = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as exc:
+  raise SystemExit(f"Cannot safely read resources.json ({type(exc).__name__}); refusing deployment")
+
+if not isinstance(items, dict):
+  raise SystemExit("resources.json must contain a JSON object; refusing deployment")
+
+tracked_keys = ("security_group_id", "key_pair_name", "instance_id")
+present = [key for key in tracked_keys if items.get(key) not in (None, "")]
+if present:
+  print("resources.json contains recorded or partial resources: " + ", ".join(present), file=sys.stderr)
+  print("Refusing to clear or overwrite the manifest; reconcile these resources before a new deployment.", file=sys.stderr)
+  raise SystemExit(1)
+PY
+}
+
 resolve_ami() {
   if [ -z "$AMI_ID" ]; then
     AMI_ID="$(aws_cmd ssm get-parameters --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query 'Parameters[0].Value' --output text)"
@@ -160,21 +189,31 @@ create_security_group() {
 ensure_key_pair() {
   local key_name="$1"
   local key_path="$HOME/.ssh/${key_name}"
+  IMPORTED_KEY_PAIR_NAME=""
   mkdir -p "$HOME/.ssh"
   chmod 700 "$HOME/.ssh"
 
   if [ ! -f "$key_path" ]; then
-    ssh-keygen -t ed25519 -f "$key_path" -N "" -C "${GROUP_NAME}@${OWNER}"
+    if ! ssh-keygen -t ed25519 -f "$key_path" -N "" -C "${GROUP_NAME}@${OWNER}" >&2; then
+      echo "ssh-keygen 失敗；未匯入 key pair。" >&2
+      return 1
+    fi
+  fi
+  if [ ! -f "${key_path}.pub" ]; then
+    echo "找不到公鑰檔 ${key_path}.pub；未匯入 key pair。" >&2
+    return 1
   fi
   chmod 600 "$key_path"
 
-  local public_key
-  public_key="$(cat "$key_path.pub")"
-  aws_cmd ec2 import-key-pair \
+  if ! aws_cmd ec2 import-key-pair \
     --key-name "$key_name" \
-    --public-key-material "$public_key" >/dev/null
+    --public-key-material "fileb://${key_path}.pub" >/dev/null
+  then
+    echo "import-key-pair 失敗；未記錄 key_pair_name。" >&2
+    return 1
+  fi
 
-  echo "$key_name"
+  IMPORTED_KEY_PAIR_NAME="$key_name"
 }
 
 build_user_data() {
@@ -191,7 +230,7 @@ create_instance() {
   local user_data_file="$5"
 
   local instance_id
-  instance_id="$(aws_cmd ec2 run-instances \
+  if ! instance_id="$(aws_cmd ec2 run-instances \
     --image-id "$ami_id" \
     --instance-type "$INSTANCE_TYPE" \
     --key-name "$key_name" \
@@ -201,7 +240,15 @@ create_instance() {
     --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
     --block-device-mappings "[{\"DeviceName\":\"/dev/xvda\",\"Ebs\":{\"VolumeSize\":8,\"VolumeType\":\"gp3\",\"Encrypted\":true,\"DeleteOnTermination\":true}}]" \
     --tag-specifications "ResourceType=instance,Tags=[{Key=course,Value=yuntech-115-1},{Key=week,Value=w03},{Key=group,Value=${GROUP_NAME}},{Key=owner,Value=${OWNER}}]" "ResourceType=volume,Tags=[{Key=course,Value=yuntech-115-1},{Key=week,Value=w03},{Key=group,Value=${GROUP_NAME}},{Key=owner,Value=${OWNER}}]" \
-    --query 'Instances[0].InstanceId' --output text)"
+    --query 'Instances[0].InstanceId' --output text)"; then
+    echo "run-instances 失敗；沒有取得 instance ID，請保留 resources.json 並先查明 AWS 結果，不要直接重跑。" >&2
+    return 1
+  fi
+
+  if [[ ! "$instance_id" =~ ^i-[a-z0-9]+$ ]]; then
+    echo "run-instances 未回傳純 instance ID：${instance_id}；停止且不寫入空白或錯誤 ID。" >&2
+    return 1
+  fi
 
   echo "$instance_id"
 }
@@ -453,6 +500,8 @@ PY
 }
 
 main() {
+  ensure_no_tracked_resources
+
   echo "=== 檢查 AWS 環境 ==="
   ensure_aws_ready
 
@@ -484,8 +533,6 @@ main() {
   fi
 
   mkdir -p "$ROOT_DIR/.local"
-  printf '{}\n' > "$RESOURCES_FILE"
-  printf '{}\n' > "$OBSERVATIONS_FILE"
 
   local sg_name="${GROUP_NAME}-sg"
   local key_name="${KEY_NAME:-${GROUP_NAME}-w03-key}"
@@ -496,7 +543,8 @@ main() {
   sg_id="$CREATED_SECURITY_GROUP_ID"
 
   local imported_key_name
-  imported_key_name="$(ensure_key_pair "$key_name")"
+  ensure_key_pair "$key_name"
+  imported_key_name="$IMPORTED_KEY_PAIR_NAME"
   write_resources_json key_pair_name "$imported_key_name"
 
   build_user_data "$DEPLOY_COMMIT" "$user_data_file"
