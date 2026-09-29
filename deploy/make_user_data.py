@@ -74,7 +74,7 @@ def main():
     args = parser.parse_args()
     sha, data = build(args.commit)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("xb") as stream:
+    with args.output.open("wb") as stream:
         args.output.chmod(0o600)
         stream.write(data)
     print(f"Commit: {sha}\nUser data: {len(data)} bytes (<16384); {args.output}")
