@@ -184,6 +184,7 @@ PUBLIC_IP="$(python3 - "$ROOT_DIR" "$RESOURCES_PATH" <<'PY'
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 root, resources_path = map(Path, sys.argv[1:])
