@@ -25,8 +25,10 @@ SSH_KEY_FILE="${SSH_KEY_FILE/#\~/$HOME}"
 bash "$ROOT/scripts/verify-aws.sh"
 HOST_IP="$(python3 - "$ROOT" "$INSTANCE_ID" <<'PY'
 import json
+import ipaddress
 from pathlib import Path
 import sys
+import urllib.request
 
 root = Path(sys.argv[1])
 instance_id = sys.argv[2]
@@ -44,6 +46,25 @@ if len(instances) != 1 or instances[0].get("State", {}).get("Name") != "running"
 public_ip = instances[0].get("PublicIpAddress")
 if not public_ip:
   raise SystemExit("STOP: recorded W3 instance has no current public IP")
+source_ip = urllib.request.urlopen("https://checkip.amazonaws.com", timeout=5).read().decode().strip()
+try:
+  source_cidr = str(ipaddress.ip_address(source_ip)) + "/32"
+except ValueError as exc:
+  raise SystemExit("STOP: could not determine a valid laptop IPv4 /32") from exc
+security_group_id = resources.get("security_group_id")
+if not security_group_id:
+  raise SystemExit("STOP: recorded W3 resources have no security group ID")
+if security_group_id not in {item.get("GroupId") for item in instances[0].get("SecurityGroups", [])}:
+  raise SystemExit("STOP: recorded security group is not attached to the W3 instance")
+group = lab.run_aws(["ec2", "describe-security-groups", "--group-ids", security_group_id], context["region"])["SecurityGroups"][0]
+allowed_ports = {
+  permission.get("FromPort")
+  for permission in group.get("IpPermissions", [])
+  if permission.get("IpProtocol") == "tcp"
+  and source_cidr in {item.get("CidrIp") for item in permission.get("IpRanges", [])}
+}
+if not {22, 80}.issubset(allowed_ports):
+  raise SystemExit(f"STOP: laptop source {source_cidr} is not allowed for TCP 22 and 80 in {security_group_id}; update the reviewed SG rule, then retry")
 print(public_ip)
 PY
 )"
@@ -58,7 +79,7 @@ printf 'Type APPROVE to continue: '
 read -r approval
 [[ "$approval" == "APPROVE" ]] || fail "deployment cancelled"
 
-SSH=(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$SSH_USER@$HOST_IP")
+SSH=(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 "$SSH_USER@$HOST_IP")
 "${SSH[@]}" 'sudo bash -s' < "$USER_DATA"
 "${SSH[@]}" 'sudo install -d -m 755 /etc/inspection && sudo install -o root -g root -m 600 /dev/stdin /etc/inspection/app.env' < "$APP_ENV"
 "${SSH[@]}" 'sudo systemctl restart inspection'

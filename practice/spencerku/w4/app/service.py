@@ -6,6 +6,7 @@ import cgi
 import hmac
 import html
 import json
+import os
 from pathlib import Path
 import re
 from threading import Lock
@@ -20,6 +21,12 @@ MAX_BODY = 4096
 
 def load_tokens(env_file):
     tokens = {name: "" for name in TOKEN_NAMES}
+    for name in TOKEN_NAMES:
+        value = os.environ.get(name, "").strip()
+        if value:
+            tokens[name] = value
+    if all(tokens.values()):
+        return tokens
     try:
         lines = Path(env_file).read_text(encoding="utf-8").splitlines()
     except OSError:
