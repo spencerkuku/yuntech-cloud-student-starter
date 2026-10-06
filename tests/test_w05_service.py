@@ -260,6 +260,8 @@ class W05ServiceContract(unittest.TestCase):
         self.assertLess(insert_at, duplicate_select_at)
         self.assertIn("VALUES (%s, %s, %s, %s, %s, %s)", source)
         self.assertIn("WHERE event_id = %s", source)
+        self.assertIn('RETURNING event_id, device_id, observed_at, "type", note, received_at', source)
+        self.assertNotIn("event_type", source)
 
     def test_matrix_redacts_secrets_and_connection_strings_in_response_bodies(self):
         body = {

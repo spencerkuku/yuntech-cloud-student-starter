@@ -107,7 +107,7 @@ def _insert_event(connection, event):
                 """
                 INSERT INTO events (event_id, device_id, observed_at, "type", note, received_at)
                 VALUES (%s, %s, %s, %s, %s, %s)
-                RETURNING event_id, device_id, observed_at, event_type, note, received_at
+                RETURNING event_id, device_id, observed_at, "type", note, received_at
                 """,
                 _event_values(event),
             )
