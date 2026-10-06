@@ -123,13 +123,16 @@ REMOTE_SECRET_CMD="sudo sh -c 'umask 077; install -d -m 700 /etc/inspection; cat
   || die "secret file could not be installed."
 # Also install DB env if present
 DB_SECRET="$ROOT/.local/db.env"
-if [ -f "$DB_SECRET" ]; then
-  DB_SECRET_MODE="$(stat -c "%a" "$DB_SECRET")"
-  [ "$DB_SECRET_MODE" = "600" ] || die "$DB_SECRET mode is $DB_SECRET_MODE, not 600."
-  printf "[2b/4] installing %s as root/600 through SSH stdin ...\n" "$DB_SECRET"
-  # append to /etc/inspection/app.env (or overwrite? secrets are key=value pairs; better append to same file)
-  "${SSH[@]}" "sudo sh -c 'umask 077; install -d -m 700 /etc/inspection; cat >> /etc/inspection/app.env; chmod 600 /etc/inspection/app.env; chown root:root /etc/inspection/app.env'" < "$DB_SECRET"     || die "db secret file could not be installed."
-fi
+[ -f "$DB_SECRET" ] || die "$DB_SECRET missing. Run deploy/db-up.sh first."
+DB_SECRET_MODE="$(stat -c "%a" "$DB_SECRET")"
+[ "$DB_SECRET_MODE" = "600" ] || die "$DB_SECRET mode is $DB_SECRET_MODE, not 600."
+for key in DB_HOST DB_NAME DB_USER DB_PASSWORD; do
+  grep -qE "^${key}=.+" "$DB_SECRET" || die "$DB_SECRET has no non-empty $key line."
+done
+printf "[2b/4] installing %s as root/600 through SSH stdin ...\n" "$DB_SECRET"
+# Append key/value settings to the root-only environment file without exposing values.
+"${SSH[@]}" "sudo sh -c 'umask 077; install -d -m 700 /etc/inspection; cat >> /etc/inspection/app.env; chmod 600 /etc/inspection/app.env; chown root:root /etc/inspection/app.env'" < "$DB_SECRET" \
+  || die "db secret file could not be installed."
 
 
 # ---------------------------------------------------------------- 2c. restart so it is read
@@ -147,9 +150,9 @@ try:
     body = json.load(sys.stdin)
 except ValueError:
     sys.exit(1)
-sys.exit(0 if body.get("version") == sys.argv[1] and body.get("auth_configured") is True else 1)
+  sys.exit(0 if body.get("version") == sys.argv[1] and body.get("auth_configured") is True and body.get("db_configured") is True else 1)
 ' "$COMMIT"; then
-    printf '\nOK  version == %s and auth_configured == true\n' "$COMMIT"
+    printf '\nOK  version == %s, auth_configured == true, db_configured == true\n' "$COMMIT"
     printf '    %s\n' "$HEALTH"
     printf '\nNext: run the rejection matrix (tests/reject_matrix.py), then open http://%s/ and\n' "$PUBLIC_IP"
     printf 'paste the OPERATOR token yourself. The token stays out of the URL and out of this log.\n'
@@ -159,7 +162,7 @@ sys.exit(0 if body.get("version") == sys.argv[1] and body.get("auth_configured")
   sleep "$PROBE_WAIT"
 done
 
-printf '\nSTOP: /health never reported version %s with auth_configured true.\n' "$COMMIT"
+printf '\nSTOP: /health never reported version %s with auth_configured and db_configured true.\n' "$COMMIT"
 printf 'The code is installed; check the host before retrying:\n'
 printf '  ssh -i %s %s@%s "sudo systemctl status inspection --no-pager"\n' "$KEY_PATH" "$SSH_USER" "$PUBLIC_IP"
 printf '  ssh -i %s %s@%s "sudo ls -l /etc/inspection/app.env"   # prints metadata, never contents\n' "$KEY_PATH" "$SSH_USER" "$PUBLIC_IP"

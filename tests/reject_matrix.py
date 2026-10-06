@@ -134,7 +134,7 @@ def main():
         ("3", "operator token sends an event", "POST", "/events", operator, event, 403),
         ("4", "reporter, observed_at has no timezone", "POST", "/events", reporter,
          json.loads(BAD_TZ.read_text(encoding="utf-8")), 400),
-        ("5", "reporter sends #1 again", "POST", "/events", reporter, event, 409),
+        ("5", "reporter sends #1 again", "POST", "/events", reporter, event, 200),
         ("6", "reporter token reads the list", "GET", "/events", reporter, None, 403),
         ("7", "operator token reads the list", "GET", "/events", operator, None, 200),
     ]

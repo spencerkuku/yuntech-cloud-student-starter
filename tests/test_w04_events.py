@@ -92,10 +92,18 @@ class HappyPath(ServiceTestCase):
         self.assertEqual(body["note"], event["note"])
         self.assertTrue(body["received_at"].endswith("Z"))
 
-    def test_duplicate_event_id_is_409(self):
+    def test_same_event_is_idempotent(self):
         event = fixture("event_01_valid.json")
         self.assertEqual(self.call("POST", "/events", token=REPORTER, body=event)[0], 201)
         status, body = self.call("POST", "/events", token=REPORTER, body=event)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["event_id"], event["event_id"])
+
+    def test_changed_event_with_same_id_is_409(self):
+        event = fixture("event_01_valid.json")
+        self.assertEqual(self.call("POST", "/events", token=REPORTER, body=event)[0], 201)
+        changed = {**event, "note": "different"}
+        status, body = self.call("POST", "/events", token=REPORTER, body=changed)
         self.assertEqual(status, 409)
         self.assertEqual(body["field"], "event_id")
 
