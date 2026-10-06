@@ -2,6 +2,7 @@
 """Deploy the committed inspection service and its private configuration to one EC2 host."""
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
