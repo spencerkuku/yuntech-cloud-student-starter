@@ -101,8 +101,8 @@ class EventStore:
             password=self.config["DB_PASSWORD"],
             sslmode="verify-full",
             sslrootcert="/etc/inspection/rds-ca.pem",
-            sslcert="/dev/null",
-            sslkey="/dev/null",
+            sslcert="/etc/inspection/rds-client.crt",
+            sslkey="/etc/inspection/rds-client.key",
             connect_timeout=5,
         )
 

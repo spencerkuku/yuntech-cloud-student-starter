@@ -33,12 +33,20 @@ def build(commit):
     payload = base64.b64encode(gzip.compress(archive.getvalue(), mtime=0)).decode()
     script = """#!/bin/bash
 set -euo pipefail
-dnf install -y nginx python3 python3-psycopg2 postgresql15
+dnf install -y nginx python3 python3-psycopg2 postgresql15 openssl
 install -d -m 755 /etc/inspection
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /etc/inspection/rds-ca.pem
 chmod 644 /etc/inspection/rds-ca.pem
 id inspection >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin inspection
 install -d -o inspection -g inspection -m 755 /home/inspection/.postgresql
+if [[ ! -s /etc/inspection/rds-client.crt || ! -s /etc/inspection/rds-client.key ]]; then
+  openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+    -keyout /etc/inspection/rds-client.key -out /etc/inspection/rds-client.crt \
+    -subj /CN=inspection-client >/dev/null 2>&1
+  chown root:root /etc/inspection/rds-client.crt /etc/inspection/rds-client.key
+  chmod 644 /etc/inspection/rds-client.crt
+  chmod 600 /etc/inspection/rds-client.key
+fi
 install -d -m 755 /opt/inspection
 base64 --decode <<'W5_ARCHIVE' | tar -xz -C /opt/inspection
 PAYLOAD
