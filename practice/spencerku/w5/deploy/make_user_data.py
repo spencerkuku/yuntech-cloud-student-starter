@@ -38,6 +38,7 @@ install -d -m 755 /etc/inspection
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /etc/inspection/rds-ca.pem
 chmod 644 /etc/inspection/rds-ca.pem
 id inspection >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin inspection
+install -d -o inspection -g inspection -m 755 /home/inspection/.postgresql
 install -d -m 755 /opt/inspection
 base64 --decode <<'W5_ARCHIVE' | tar -xz -C /opt/inspection
 PAYLOAD
