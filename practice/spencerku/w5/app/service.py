@@ -46,6 +46,14 @@ def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def safe_database_error(error, config):
+    message = str(error)
+    for name in DB_NAMES:
+        if config.get(name):
+            message = message.replace(config[name], "<redacted>")
+    return f"{type(error).__name__} {getattr(error, 'pgcode', '')} {message[:160]}"
+
+
 def validate_event(event):
     if not isinstance(event, dict):
         return "event must be a JSON object", None
@@ -337,7 +345,7 @@ def make_server(version_file, port=8080, env_file="/etc/inspection/app.env"):
                 try:
                     self.send_json(200, {"events": store.list_latest()})
                 except Exception as error:
-                    print(f"database read failed: {type(error).__name__} {getattr(error, 'pgcode', '')}", flush=True)
+                    print("database read failed: " + safe_database_error(error, env), flush=True)
                     self.send_error_json(503, "database unavailable")
                 return
             prefix = "/events/"
@@ -347,7 +355,7 @@ def make_server(version_file, port=8080, env_file="/etc/inspection/app.env"):
                 try:
                     event = store.get(path[len(prefix):])
                 except Exception as error:
-                    print(f"database read failed: {type(error).__name__} {getattr(error, 'pgcode', '')}", flush=True)
+                    print("database read failed: " + safe_database_error(error, env), flush=True)
                     self.send_error_json(503, "database unavailable")
                     return
                 if event is None:
@@ -387,7 +395,7 @@ def make_server(version_file, port=8080, env_file="/etc/inspection/app.env"):
             try:
                 status, stored = store.insert(event)
             except Exception as error:
-                print(f"database write failed: {type(error).__name__} {getattr(error, 'pgcode', '')}", flush=True)
+                print("database write failed: " + safe_database_error(error, env), flush=True)
                 self.send_error_json(503, "database unavailable")
                 return
             if status == 409:
