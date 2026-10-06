@@ -43,10 +43,13 @@ if [[ ! -s /etc/inspection/rds-client.crt || ! -s /etc/inspection/rds-client.key
   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
     -keyout /etc/inspection/rds-client.key -out /etc/inspection/rds-client.crt \
     -subj /CN=inspection-client >/dev/null 2>&1
-  chown root:root /etc/inspection/rds-client.crt /etc/inspection/rds-client.key
+  chown inspection:inspection /etc/inspection/rds-client.crt /etc/inspection/rds-client.key
   chmod 644 /etc/inspection/rds-client.crt
   chmod 600 /etc/inspection/rds-client.key
 fi
+chown inspection:inspection /etc/inspection/rds-client.crt /etc/inspection/rds-client.key
+chmod 644 /etc/inspection/rds-client.crt
+chmod 600 /etc/inspection/rds-client.key
 install -d -m 755 /opt/inspection
 base64 --decode <<'W5_ARCHIVE' | tar -xz -C /opt/inspection
 PAYLOAD
