@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Run the five W5 idempotency checks without printing secrets."""
 import argparse
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -36,6 +38,13 @@ def call(base_url, method, path, body=None, token=None):
     except HTTPError as error:
         return error.code, json.loads(error.read())
     except (URLError, TimeoutError) as error:
+        if method == "GET":
+            time.sleep(1)
+            try:
+                with urlopen(request, timeout=8) as response:
+                    return response.status, json.loads(response.read())
+            except (URLError, TimeoutError):
+                pass
         return 0, {"error": type(error).__name__}
 
 
@@ -61,6 +70,7 @@ def host_details(instance_id):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--instance-id")
+    parser.add_argument("--event-id")
     parser.add_argument("--env-file", type=Path, default=W5 / ".local/app.env")
     parser.add_argument("--config-file", type=Path, default=W5 / ".local/w5.env")
     args = parser.parse_args()
@@ -72,7 +82,9 @@ def main():
     operator = values.get("OPERATOR_TOKEN", "")
     config = read_env(args.config_file)
     event = {
-        "event_id": "g02-spencerku-w5-0001",
+        "event_id": args.event_id or (
+            "g02-spencerku-w5-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        ),
         "device_id": "g02-d01",
         "observed_at": "2026-10-06T09:00:00+08:00",
         "type": "test",
@@ -110,14 +122,22 @@ def main():
              "/events/" + event["event_id"], None, operator, 200)
 
     remote_sql = (
-        "sudo bash -c 'set -a; . /etc/inspection/app.env; set +a; "
-        'PGPASSWORD=\"$DB_PASSWORD\" psql '
-        '"host=$DB_HOST dbname=$DB_NAME user=$DB_USER sslmode=verify-full '
-        'sslrootcert=/etc/inspection/rds-ca.pem" -At '
-        '-v event_id="' + event["event_id"] + '" '
-        "\"-c\" \"SELECT count(*) FROM events WHERE event_id = :'event_id';\"'"
+        "set -a\n"
+        ". /etc/inspection/app.env\n"
+        "set +a\n"
+        "PGPASSWORD=\"$DB_PASSWORD\" psql "
+        "\"host=$DB_HOST dbname=$DB_NAME user=$DB_USER sslmode=verify-full "
+        "sslrootcert=/etc/inspection/rds-ca.pem\" "
+        "-v event_id=\"" + event["event_id"] + "\" -At <<'SQL'\n"
+        "SELECT count(*) FROM events WHERE event_id = :'event_id';\n"
+        "SQL\n"
     )
-    count = subprocess.run(ssh + [remote_sql], capture_output=True, text=True)
+    count = subprocess.run(
+        ssh + ["sudo", "bash", "-s"],
+        input=remote_sql,
+        capture_output=True,
+        text=True,
+    )
     if count.returncode:
         raise SystemExit("STOP: EC2 psql query failed")
     print(json.dumps({"case": 5, "name": "database count", "status": 200,
