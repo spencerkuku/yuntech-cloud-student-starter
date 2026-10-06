@@ -337,7 +337,7 @@ def make_server(version_file, port=8080, env_file="/etc/inspection/app.env"):
                 try:
                     self.send_json(200, {"events": store.list_latest()})
                 except Exception as error:
-                    print(f"database read failed: {type(error).__name__} {getattr(error, 'pgcode', '')}")
+                    print(f"database read failed: {type(error).__name__} {getattr(error, 'pgcode', '')}", flush=True)
                     self.send_error_json(503, "database unavailable")
                 return
             prefix = "/events/"
@@ -347,7 +347,7 @@ def make_server(version_file, port=8080, env_file="/etc/inspection/app.env"):
                 try:
                     event = store.get(path[len(prefix):])
                 except Exception as error:
-                    print(f"database read failed: {type(error).__name__} {getattr(error, 'pgcode', '')}")
+                    print(f"database read failed: {type(error).__name__} {getattr(error, 'pgcode', '')}", flush=True)
                     self.send_error_json(503, "database unavailable")
                     return
                 if event is None:
@@ -387,7 +387,7 @@ def make_server(version_file, port=8080, env_file="/etc/inspection/app.env"):
             try:
                 status, stored = store.insert(event)
             except Exception as error:
-                print(f"database write failed: {type(error).__name__} {getattr(error, 'pgcode', '')}")
+                print(f"database write failed: {type(error).__name__} {getattr(error, 'pgcode', '')}", flush=True)
                 self.send_error_json(503, "database unavailable")
                 return
             if status == 409:
