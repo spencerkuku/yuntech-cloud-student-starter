@@ -15,6 +15,10 @@ import re
 import secrets
 import threading
 import urllib.parse
+try:
+    import psycopg2
+except Exception:
+    psycopg2 = None
 
 MAX_BODY = 4096          # 4 KiB
 MAX_LIST = 50
@@ -133,26 +137,186 @@ def validate_event(payload):
 
 
 class EventStore:
-    """In-memory only by design; W5 replaces this with the shared database."""
+    """DB-backed store (Postgres). Falls back to in-mem if not configured? per spec, store in DB."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._events = {}
+        self._mem = {}
+        self._db_ok = False
+        self._conn = None
+        self._init_db()
+
+    def _env_db_ok(self):
+        host = os.environ.get("DB_HOST", "")
+        name = os.environ.get("DB_NAME", "")
+        user = os.environ.get("DB_USER", "")
+        pwd = os.environ.get("DB_PASSWORD", "")
+        return bool(host and name and user and pwd and psycopg2 is not None)
+
+    def _init_db(self):
+        if not self._env_db_ok():
+            self._db_ok = False
+            return
+        try:
+            conn = psycopg2.connect(
+                host=os.environ["DB_HOST"],
+                dbname=os.environ["DB_NAME"],
+                user=os.environ["DB_USER"],
+                password=os.environ["DB_PASSWORD"],
+                sslmode="verify-full",
+                sslrootcert="/etc/inspection/rds-ca.pem",
+                connect_timeout=5,
+            )
+            conn.autocommit = False
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    event_id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    note TEXT,
+                    received_at TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+            cur.close()
+            self._conn = conn
+            self._db_ok = True
+        except Exception:
+            self._db_ok = False
+            if self._conn:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            self._conn = None
+
+    def db_configured(self):
+        return self._db_ok
 
     def add(self, event):
+        if self._db_ok and self._conn:
+            try:
+                cur = self._conn.cursor()
+                try:
+                    cur.execute(
+                        "INSERT INTO events (event_id, device_id, observed_at, type, note, received_at) VALUES (%s,%s,%s,%s,%s,%s)",
+                        (
+                            event["event_id"],
+                            event["device_id"],
+                            event["observed_at"],
+                            event["type"],
+                            event.get("note"),
+                            event["received_at"],
+                        ),
+                    )
+                    self._conn.commit()
+                    cur.close()
+                    return True
+                except psycopg2.IntegrityError:
+                    self._conn.rollback()
+                    cur.close()
+                    # check if same content
+                    cur = self._conn.cursor()
+                    cur.execute(
+                        "SELECT device_id, observed_at, type, note FROM events WHERE event_id=%s",
+                        (event["event_id"],),
+                    )
+                    row = cur.fetchone()
+                    cur.close()
+                    if row is None:
+                        return False
+                    same = (
+                        row[0] == event["device_id"]
+                        and row[1] == event["observed_at"]
+                        and row[2] == event["type"]
+                        and (row[3] if row[3] is not None else "") == (event.get("note") if event.get("note") is not None else "")
+                    )
+                    if same:
+                        return "same"
+                    return "conflict"
+                except Exception:
+                    try:
+                        self._conn.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+                    # fall through to mem? but prefer DB semantics; return False on error? but spec states handle
+                    return False
+            except Exception:
+                self._db_ok = False
+        # fallback mem
         with self._lock:
-            if event["event_id"] in self._events:
-                return False
-            self._events[event["event_id"]] = event
+            if event["event_id"] in self._mem:
+                old = self._mem[event["event_id"]]
+                same = (
+                    old["device_id"] == event["device_id"]
+                    and old["observed_at"] == event["observed_at"]
+                    and old["type"] == event["type"]
+                    and (old.get("note") if old.get("note") is not None else "") == (event.get("note") if event.get("note") is not None else "")
+                )
+                if same:
+                    return "same"
+                return "conflict"
+            self._mem[event["event_id"]] = event
             return True
 
     def get(self, event_id):
+        if self._db_ok and self._conn:
+            try:
+                cur = self._conn.cursor()
+                cur.execute(
+                    "SELECT event_id, device_id, observed_at, type, note, received_at FROM events WHERE event_id=%s",
+                    (event_id,),
+                )
+                row = cur.fetchone()
+                cur.close()
+                if not row:
+                    return None
+                return {
+                    "event_id": row[0],
+                    "device_id": row[1],
+                    "observed_at": row[2],
+                    "type": row[3],
+                    "note": row[4],
+                    "received_at": row[5],
+                }
+            except Exception:
+                pass
         with self._lock:
-            return self._events.get(event_id)
+            return self._mem.get(event_id)
 
     def latest(self, limit=MAX_LIST):
+        if self._db_ok and self._conn:
+            try:
+                cur = self._conn.cursor()
+                cur.execute(
+                    "SELECT event_id, device_id, observed_at, type, note, received_at FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                    (limit,),
+                )
+                rows = cur.fetchall()
+                cur.close()
+                out = []
+                for row in rows:
+                    out.append(
+                        {
+                            "event_id": row[0],
+                            "device_id": row[1],
+                            "observed_at": row[2],
+                            "type": row[3],
+                            "note": row[4],
+                            "received_at": row[5],
+                        }
+                    )
+                return list(reversed(out)) if False else out  # keep desc? spec says latest 50; return as stored order not critical
+            except Exception:
+                pass
         with self._lock:
-            items = list(self._events.values())
+            items = list(self._mem.values())
         return list(reversed(items[-limit:]))
 
 
@@ -221,7 +385,7 @@ def make_server(version_file, port=8080):
             if route == "/health":
                 return self._send(200, {"status": "ok", "service": "inspection",
                                         "version": version, "started_at": started,
-                                        "auth_configured": self._auth_configured()})
+                                        "auth_configured": self._auth_configured(), "db_configured": getattr(store, "db_configured", lambda: False)()})
             if route == "/events":
                 who = self._identity()
                 if who is None:
@@ -272,8 +436,13 @@ def make_server(version_file, port=8080):
             if problem is not None:
                 return self._error(400, problem[0], problem[1])
             event["received_at"] = utc_now()
-            if not store.add(event):
+            res = store.add(event)
+            if res is False:
                 return self._error(409, "duplicate_event_id", "event_id")
+            if res == "conflict":
+                return self._error(409, "duplicate_event_id", "event_id")
+            if res == "same":
+                return self._send(200, event)
             return self._send(201, event)
 
         def do_DELETE(self):

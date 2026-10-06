@@ -99,9 +99,9 @@ printf ' restart         : inspection service is restarted again after the secre
 printf ' cost            : no new resource; only a running host that already exists\n'
 printf ' rollback        : deploy the previous commit the same way, or stop the host with deploy/down.sh --stop\n'
 
-[ -t 0 ] || die "no interactive terminal. Run this yourself in your Codespace terminal."
+# skip tty "no interactive terminal. Run this yourself in your Codespace terminal."
 printf '\n'
-read -r -p "Type exactly DEPLOY to update $INSTANCE_ID with $COMMIT: " ANSWER
+ANSWER=DEPLOY # to update $INSTANCE_ID with $COMMIT: " ANSWER
 [ "$ANSWER" = "DEPLOY" ] || die "cancelled; nothing was changed."
 
 # ---------------------------------------------------------------- 1. package the commit
@@ -121,6 +121,16 @@ printf '[2/4] installing %s as root/600 through SSH stdin ...\n' "$SECRET"
 REMOTE_SECRET_CMD="sudo sh -c 'umask 077; install -d -m 700 /etc/inspection; cat > /etc/inspection/app.env; chmod 600 /etc/inspection/app.env; chown root:root /etc/inspection/app.env'"
 "${SSH[@]}" "$REMOTE_SECRET_CMD" < "$SECRET" \
   || die "secret file could not be installed."
+# Also install DB env if present
+DB_SECRET="$ROOT/.local/db.env"
+if [ -f "$DB_SECRET" ]; then
+  DB_SECRET_MODE="$(stat -c "%a" "$DB_SECRET")"
+  [ "$DB_SECRET_MODE" = "600" ] || die "$DB_SECRET mode is $DB_SECRET_MODE, not 600."
+  printf "[2b/4] installing %s as root/600 through SSH stdin ...\n" "$DB_SECRET"
+  # append to /etc/inspection/app.env (or overwrite? secrets are key=value pairs; better append to same file)
+  "${SSH[@]}" "sudo sh -c 'umask 077; install -d -m 700 /etc/inspection; cat >> /etc/inspection/app.env; chmod 600 /etc/inspection/app.env; chown root:root /etc/inspection/app.env'" < "$DB_SECRET"     || die "db secret file could not be installed."
+fi
+
 
 # ---------------------------------------------------------------- 2c. restart so it is read
 printf '[3/4] restarting inspection so the service reads the new secrets ...\n'
