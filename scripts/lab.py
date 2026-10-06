@@ -5,6 +5,8 @@ import configparser
 
 import hashlib
 
+import getpass
+
 import io
 
 import json
@@ -126,12 +128,15 @@ def configure():
     account = input("12-digit account ID shown in YOUR Learner Lab console: ").strip()
     if not re.fullmatch(r"\d{12}", account):
         raise LabError("Invalid account ID.")
-    values = {key: input(label + ": ").strip() for key, label in (
+    values = {}
+    for key, label in (
         ("aws_access_key_id", "Access key ID"),
         ("aws_secret_access_key", "Secret access key"),
-        ("aws_session_token", "Session token"))}
-    if any(not v or any(ch.isspace() for ch in v) for v in values.values()):
-        raise LabError("Paste each VALUE only, without labels, quotes, or whitespace.")
+        ("aws_session_token", "Session token")):
+        value = getpass.getpass(label + ": ")
+        if not value or any(ch.isspace() for ch in value):
+            raise LabError("Paste each VALUE only, without labels, quotes, or whitespace.")
+        values[key] = value
     # Verify before overwriting a working profile. Temporary files stay outside the repository.
     with tempfile.TemporaryDirectory(prefix="learnerlab-", dir=Path.home()) as td:
         cred, cfg = Path(td) / "credentials", Path(td) / "config"

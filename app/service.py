@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""W4 inspection service: health, authenticated event API, and display page."""
-
+"""Inspection service with access control and PostgreSQL-backed event storage."""
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
@@ -8,327 +7,373 @@ import json
 import os
 from pathlib import Path
 import re
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlparse
 
 
-EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
-ALLOWED_TYPES = {"status", "anomaly", "test"}
-ALLOWED_FIELDS = {"event_id", "device_id", "observed_at", "type", "note"}
-REQUIRED_FIELDS = {"event_id", "device_id", "observed_at", "type"}
-MAX_BODY_BYTES = 4096
+ALLOWED_EVENT_FIELDS = {"event_id", "device_id", "observed_at", "type", "note"}
+REQUIRED_EVENT_FIELDS = ("event_id", "device_id", "observed_at", "type")
+MAX_EVENT_BYTES = 4096
+
+
+def load_app_env():
+    return dict(os.environ)
+
+
+def db_is_configured(env):
+    return all(env.get(name) for name in ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"))
+
+
+def _database_error_types():
+    try:
+        import psycopg2
+    except ImportError:
+        return (ImportError, OSError)
+    return (psycopg2.Error, OSError)
+
+
+def _connect_db(env):
+    import psycopg2
+
+    return psycopg2.connect(
+        host=env["DB_HOST"],
+        dbname=env["DB_NAME"],
+        user=env["DB_USER"],
+        password=env["DB_PASSWORD"],
+        sslmode="verify-full",
+        sslrootcert="/etc/inspection/rds-ca.pem",
+        connect_timeout=5,
+    )
+
+
+def _ensure_schema(connection):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                event_id VARCHAR(64) PRIMARY KEY,
+                device_id VARCHAR(32) NOT NULL,
+                observed_at TEXT NOT NULL,
+                "type" VARCHAR(16) NOT NULL,
+                note VARCHAR(200),
+                received_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+    connection.commit()
+
+
+def _event_from_row(row):
+    if row is None:
+        return None
+    received_at = row[5]
+    if isinstance(received_at, datetime):
+        received_at = received_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    event = {
+        "event_id": row[0],
+        "device_id": row[1],
+        "observed_at": row[2],
+        "type": row[3],
+        "received_at": received_at,
+    }
+    if row[4] is not None:
+        event["note"] = row[4]
+    return event
+
+
+def _event_values(event):
+    return (
+        event["event_id"],
+        event["device_id"],
+        event["observed_at"],
+        event["type"],
+        event.get("note"),
+        datetime.now(timezone.utc),
+    )
+
+
+def _same_event(existing, submitted):
+    return all(existing.get(field) == submitted.get(field) for field in REQUIRED_EVENT_FIELDS) and (
+        existing.get("note") == submitted.get("note")
+    )
+
+
+def _insert_event(connection, event):
+    import psycopg2
+
+    _ensure_schema(connection)
+    with connection.cursor() as cursor:
+        try:
+            cursor.execute(
+                """
+                INSERT INTO events (event_id, device_id, observed_at, "type", note, received_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING event_id, device_id, observed_at, event_type, note, received_at
+                """,
+                _event_values(event),
+            )
+            created = _event_from_row(cursor.fetchone())
+            connection.commit()
+            return 201, created
+        except psycopg2.IntegrityError as exc:
+            if getattr(exc, "pgcode", None) != "23505":
+                connection.rollback()
+                raise
+            connection.rollback()
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT event_id, device_id, observed_at, "type", note, received_at
+            FROM events WHERE event_id = %s
+            """,
+            (event["event_id"],),
+        )
+        existing = _event_from_row(cursor.fetchone())
+    if existing is None:
+        raise RuntimeError("unique event disappeared")
+    if _same_event(existing, event):
+        return 200, existing
+    return 409, None
+
+
+def _list_events(connection, limit=50):
+    _ensure_schema(connection)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT event_id, device_id, observed_at, "type", note, received_at
+            FROM events ORDER BY received_at DESC, event_id LIMIT %s
+            """,
+            (limit,),
+        )
+        return [_event_from_row(row) for row in cursor.fetchall()]
+
+
+def _get_event(connection, event_id):
+    _ensure_schema(connection)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT event_id, device_id, observed_at, "type", note, received_at
+            FROM events WHERE event_id = %s
+            """,
+            (event_id,),
+        )
+        return _event_from_row(cursor.fetchone())
+
+
+def _validate_event(event):
+    if not isinstance(event, dict):
+        raise ValueError("body")
+    extra_fields = set(event) - ALLOWED_EVENT_FIELDS
+    if extra_fields:
+        raise ValueError(sorted(extra_fields)[0])
+    missing = [field for field in REQUIRED_EVENT_FIELDS if field not in event]
+    if missing:
+        raise ValueError(missing[0])
+
+    for field, max_length in (("event_id", 64), ("device_id", 32)):
+        value = event[field]
+        if not isinstance(value, str) or len(value) > max_length:
+            raise ValueError(field)
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+            raise ValueError(field)
+
+    observed_at = event["observed_at"]
+    if not isinstance(observed_at, str):
+        raise ValueError("observed_at")
+    try:
+        parsed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("observed_at") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("observed_at")
+
+    if not isinstance(event["type"], str) or event["type"] not in {"status", "anomaly", "test"}:
+        raise ValueError("type")
+    if "note" in event and (not isinstance(event["note"], str) or len(event["note"]) > 200):
+        raise ValueError("note")
+    return event
+
+
+def _authorized_role(header, role, env):
+    reporter = env.get("REPORTER_TOKEN", "")
+    operator = env.get("OPERATOR_TOKEN", "")
+    if not reporter or not operator or hmac.compare_digest(reporter, operator):
+        return False, 401
+    token = header or ""
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    reporter_match = hmac.compare_digest(token, reporter)
+    operator_match = hmac.compare_digest(token, operator)
+    if not reporter_match and not operator_match:
+        return False, 401
+    if (role == "reporter" and not reporter_match) or (role == "operator" and not operator_match):
+        return False, 403
+    return True, 200
 
 
 def make_server(version_file, port=8080):
     version = Path(version_file).read_text(encoding="utf-8").strip()
     if not re.fullmatch(r"[0-9a-f]{40}", version):
         raise ValueError("version must contain the deployed 40-character Git commit SHA")
-
-    started = (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
-    )
-
-    reporter_token = os.environ.get("REPORTER_TOKEN", "")
-    operator_token = os.environ.get("OPERATOR_TOKEN", "")
-    auth_configured = bool(reporter_token and operator_token)
-
-    # W4 intentionally stores events only in memory.
-    events = []
-    event_ids = set()
-
-    def token_role(header):
-        if not header or not header.startswith("Bearer "):
-            return None
-
-        token = header[len("Bearer "):]
-
-        if reporter_token and hmac.compare_digest(token, reporter_token):
-            return "reporter"
-
-        if operator_token and hmac.compare_digest(token, operator_token):
-            return "operator"
-
-        return None
-
-    def validate_event(event):
-        if not isinstance(event, dict):
-            return "invalid_json_object", "body"
-
-        extra = set(event) - ALLOWED_FIELDS
-        if extra:
-            return "unexpected_field", sorted(extra)[0]
-
-        for field in REQUIRED_FIELDS:
-            if field not in event:
-                return "missing_field", field
-
-        event_id = event["event_id"]
-        if not isinstance(event_id, str) or not EVENT_ID_RE.fullmatch(event_id):
-            return "invalid_field", "event_id"
-
-        device_id = event["device_id"]
-        if not isinstance(device_id, str) or not DEVICE_ID_RE.fullmatch(device_id):
-            return "invalid_field", "device_id"
-
-        observed_at = event["observed_at"]
-        if not isinstance(observed_at, str):
-            return "invalid_field", "observed_at"
-
-        try:
-            parsed_time = datetime.fromisoformat(
-                observed_at.replace("Z", "+00:00")
-            )
-        except ValueError:
-            return "invalid_field", "observed_at"
-
-        if parsed_time.tzinfo is None or parsed_time.utcoffset() is None:
-            return "invalid_field", "observed_at"
-
-        if event["type"] not in ALLOWED_TYPES:
-            return "invalid_field", "type"
-
-        if "note" in event:
-            note = event["note"]
-            if not isinstance(note, str) or len(note) > 200:
-                return "invalid_field", "note"
-
-        return None
+    started = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
             super().setup()
             self.connection.settimeout(5)
 
-        def send_json(self, status, body):
-            data = json.dumps(
-                body,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-
+        def _send_json(self, status, payload):
+            data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
             self.send_response(status)
-            self.send_header(
-                "Content-Type",
-                "application/json; charset=utf-8",
-            )
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(data)
 
-        def send_error_json(self, status, error, field=""):
-            self.send_json(
-                status,
-                {
-                    "error": error,
-                    "field": field,
-                },
-            )
+        def _send_html(self, body):
+            data = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
 
-        def authenticate(self, required_role):
-            role = token_role(self.headers.get("Authorization"))
+        def _error(self, status, error, field):
+            self._send_json(status, {"error": error, "field": field})
 
-            if role is None:
-                self.send_error_json(401, "unauthorized", "authorization")
-                return False
+        def _require_role(self, role, env):
+            allowed, status = _authorized_role(self.headers.get("Authorization"), role, env)
+            if allowed:
+                return True
+            self._error(status, "unauthorized" if status == 401 else "forbidden", "Authorization")
+            return False
 
-            if role != required_role:
-                self.send_error_json(403, "forbidden", "authorization")
-                return False
+        def _read_event(self):
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                raise ValueError("Content-Type")
+            length_header = self.headers.get("Content-Length")
+            if length_header is None or not length_header.isdecimal():
+                raise ValueError("body")
+            length = int(length_header)
+            if length > MAX_EVENT_BYTES:
+                raise ValueError("body")
+            raw = self.rfile.read(length)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("body") from exc
+            return _validate_event(payload)
 
-            return True
+        def _with_db(self, action):
+            env = load_app_env()
+            if not db_is_configured(env):
+                return False, None
+            connection = None
+            try:
+                connection = _connect_db(env)
+                return True, action(connection)
+            finally:
+                if connection is not None:
+                    connection.close()
 
         def do_GET(self):
-            path = urlsplit(self.path).path
-
+            parsed = urlparse(self.path)
+            path = parsed.path
             if path == "/health":
-                self.send_json(
-                    200,
-                    {
-                        "status": "ok",
-                        "service": "inspection",
-                        "version": version,
-                        "started_at": started,
-                        "auth_configured": auth_configured,
-                    },
-                )
+                env = load_app_env()
+                self._send_json(200, {
+                    "status": "ok",
+                    "service": "inspection",
+                    "version": version,
+                    "started_at": started,
+                    "auth_configured": bool(
+                        env.get("REPORTER_TOKEN")
+                        and env.get("OPERATOR_TOKEN")
+                        and not hmac.compare_digest(env["REPORTER_TOKEN"], env["OPERATOR_TOKEN"])
+                    ),
+                    "db_configured": db_is_configured(env),
+                })
                 return
-
             if path == "/":
-                self.send_page()
+                self._send_html("""<!doctype html>
+<html><head><meta charset="utf-8"><title>Inspection</title></head>
+<body><h1>Inspection events</h1>
+<label>Operator token <input id="token" type="password"></label>
+<button id="load">Load events</button><pre id="output"></pre>
+<script>
+const output = document.getElementById('output');
+document.getElementById('load').addEventListener('click', async () => {
+  output.textContent = 'Loading...';
+  const token = document.getElementById('token').value;
+  const response = await fetch('/events', {headers: {Authorization: 'Bearer ' + token}});
+  output.textContent = await response.text();
+});
+</script></body></html>""")
                 return
-
             if path == "/events":
-                if not self.authenticate("operator"):
+                if not self._require_role("operator", load_app_env()):
                     return
-
-                self.send_json(
-                    200,
-                    {
-                        "events": list(reversed(events[-50:])),
-                    },
-                )
+                try:
+                    configured, result = self._with_db(_list_events)
+                    if not configured:
+                        self._error(503, "database not configured", "database")
+                    else:
+                        self._send_json(200, {"events": result})
+                except _database_error_types():
+                    self._error(503, "database unavailable", "database")
                 return
-
             if path.startswith("/events/"):
-                if not self.authenticate("operator"):
+                if not self._require_role("operator", load_app_env()):
                     return
-
-                event_id = unquote(path[len("/events/"):])
-
-                if "/" in event_id or not event_id:
-                    self.send_error_json(404, "not_found", "event_id")
+                event_id = path.removeprefix("/events/")
+                if not event_id or "/" in event_id:
+                    self._error(404, "not_found", "event_id")
                     return
-
-                for event in events:
-                    if event["event_id"] == event_id:
-                        self.send_json(200, event)
-                        return
-
-                self.send_error_json(404, "not_found", "event_id")
+                try:
+                    configured, result = self._with_db(lambda connection: _get_event(connection, event_id))
+                    if not configured:
+                        self._error(503, "database not configured", "database")
+                    elif result is None:
+                        self._error(404, "not_found", "event_id")
+                    else:
+                        self._send_json(200, result)
+                except _database_error_types():
+                    self._error(503, "database unavailable", "database")
                 return
-
-            self.send_error_json(404, "not_found", "path")
+            self._error(404, "not_found", "path")
 
         def do_POST(self):
-            path = urlsplit(self.path).path
-
-            if path != "/events":
-                self.send_error_json(404, "not_found", "path")
+            if urlparse(self.path).path != "/events":
+                self._error(404, "not_found", "path")
                 return
-
-            # Required review order:
-            # 401 -> 403 -> 400 -> 409 -> 201
-            if not self.authenticate("reporter"):
+            if not self._require_role("reporter", load_app_env()):
                 return
-
-            content_type = self.headers.get("Content-Type", "")
-            if content_type.split(";", 1)[0].strip().lower() != "application/json":
-                self.send_error_json(400, "invalid_content_type", "content_type")
-                return
-
-            content_length_text = self.headers.get("Content-Length")
-
             try:
-                content_length = int(content_length_text)
-            except (TypeError, ValueError):
-                self.send_error_json(400, "invalid_body", "body")
+                event = self._read_event()
+            except ValueError as exc:
+                self._error(400, "invalid event", str(exc))
                 return
-
-            if content_length < 0 or content_length > MAX_BODY_BYTES:
-                self.send_error_json(400, "body_too_large", "body")
-                return
-
-            raw = self.rfile.read(content_length)
-
-            if len(raw) > MAX_BODY_BYTES:
-                self.send_error_json(400, "body_too_large", "body")
-                return
-
             try:
-                event = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                self.send_error_json(400, "invalid_json", "body")
-                return
-
-            validation_error = validate_event(event)
-            if validation_error:
-                error, field = validation_error
-                self.send_error_json(400, error, field)
-                return
-
-            if event["event_id"] in event_ids:
-                self.send_error_json(409, "duplicate_event", "event_id")
-                return
-
-            stored_event = dict(event)
-            stored_event["received_at"] = (
-                datetime.now(timezone.utc)
-                .isoformat(timespec="seconds")
-                .replace("+00:00", "Z")
-            )
-
-            events.append(stored_event)
-            event_ids.add(stored_event["event_id"])
-
-            self.send_json(201, stored_event)
-
-        def send_page(self):
-            page = """<!doctype html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Inspection Events</title>
-</head>
-<body>
-  <h1>Inspection Events</h1>
-
-  <label for="token">Operator token</label>
-  <input id="token" type="password" autocomplete="off">
-  <button id="load" type="button">Load events</button>
-
-  <p id="status"></p>
-  <pre id="events"></pre>
-
-  <script>
-    const tokenInput = document.getElementById("token");
-    const statusNode = document.getElementById("status");
-    const eventsNode = document.getElementById("events");
-
-    document.getElementById("load").addEventListener("click", async () => {
-      const token = tokenInput.value;
-
-      statusNode.textContent = "Loading...";
-      eventsNode.textContent = "";
-
-      try {
-        const response = await fetch("/events", {
-          method: "GET",
-          headers: {
-            "Authorization": "Bearer " + token
-          }
-        });
-
-        const data = await response.json();
-
-        if (!response.ok) {
-          statusNode.textContent = "Request failed: HTTP " + response.status;
-          return;
-        }
-
-        statusNode.textContent = "HTTP 200";
-        eventsNode.textContent = JSON.stringify(data.events, null, 2);
-      } catch (error) {
-        statusNode.textContent = "Request failed";
-      }
-    });
-  </script>
-</body>
-</html>
-"""
-            data = page.encode("utf-8")
-
-            self.send_response(200)
-            self.send_header(
-                "Content-Type",
-                "text/html; charset=utf-8",
-            )
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(data)
+                configured, result = self._with_db(lambda connection: _insert_event(connection, event))
+                if not configured:
+                    self._error(503, "database not configured", "database")
+                elif result[0] == 409:
+                    self._error(409, "event_id conflict", "event_id")
+                else:
+                    self._send_json(result[0], result[1])
+            except _database_error_types():
+                self._error(503, "database unavailable", "database")
 
         def log_message(self, fmt, *args):
-            # Never log paths, request bodies, headers, tokens, or events.
             pass
 
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
 if __name__ == "__main__":
-    make_server(
-        Path(__file__).with_name("version")
-    ).serve_forever()
+    make_server(Path(__file__).with_name("version")).serve_forever()

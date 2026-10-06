@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from datetime import datetime, timezone
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,16 +30,40 @@ def load_fixture(name):
         return json.load(f)
 
 
+class OfflineConnection:
+    def close(self):
+        pass
+
+
 class W04ServiceContract(unittest.TestCase):
     def setUp(self):
+        self.events = {}
         self.env = patch.dict(
             os.environ,
             {
                 "REPORTER_TOKEN": REPORTER_TOKEN,
                 "OPERATOR_TOKEN": OPERATOR_TOKEN,
+                "DB_HOST": "offline.invalid",
+                "DB_NAME": "inspection",
+                "DB_USER": "inspection_app",
+                "DB_PASSWORD": "offline-only",
             },
         )
         self.env.start()
+        self.db = patch.object(service, "_connect_db", return_value=OfflineConnection())
+        self.db.start()
+        self.insert = patch.object(service, "_insert_event", side_effect=self.insert_event)
+        self.insert.start()
+        self.list_events = patch.object(
+            service, "_list_events",
+            side_effect=lambda connection: list(self.events.values())[-50:],
+        )
+        self.list_events.start()
+        self.get_event = patch.object(
+            service, "_get_event",
+            side_effect=lambda connection, event_id: self.events.get(event_id),
+        )
+        self.get_event.start()
 
         self.tempdir = tempfile.TemporaryDirectory()
         version = Path(self.tempdir.name) / "version"
@@ -56,7 +81,24 @@ class W04ServiceContract(unittest.TestCase):
         self.server.server_close()
         self.worker.join(timeout=2)
         self.tempdir.cleanup()
+        self.get_event.stop()
+        self.list_events.stop()
+        self.insert.stop()
+        self.db.stop()
         self.env.stop()
+
+    def insert_event(self, connection, event):
+        existing = self.events.get(event["event_id"])
+        if existing is None:
+            created = dict(event)
+            created["received_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.events[event["event_id"]] = created
+            return 201, created
+        if all(existing.get(key) == event.get(key) for key in (
+            "event_id", "device_id", "observed_at", "type", "note"
+        )):
+            return 200, existing
+        return 409, None
 
     def request(
         self,
@@ -160,7 +202,7 @@ class W04ServiceContract(unittest.TestCase):
 
         self.assertEqual(status, 403)
 
-    def test_duplicate_returns_409(self):
+    def test_duplicate_returns_200(self):
         event = load_fixture("event_valid.json")
 
         first, _ = self.request(
@@ -177,7 +219,7 @@ class W04ServiceContract(unittest.TestCase):
         )
 
         self.assertEqual(first, 201)
-        self.assertEqual(second, 409)
+        self.assertEqual(second, 200)
 
     def test_reporter_cannot_read_list(self):
         status, _ = self.request(
