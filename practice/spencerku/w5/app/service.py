@@ -76,7 +76,7 @@ class EventStore:
     """Use PostgreSQL when configured; retain an in-memory mode for local tests."""
 
     def __init__(self, env_file):
-        self.config = load_env(env_file)
+        self.config = env_file if isinstance(env_file, dict) else load_env(env_file)
         self.db_configured = all(self.config[name] for name in DB_NAMES)
         self.memory = {}
         self.memory_order = []
@@ -269,7 +269,7 @@ def make_server(version_file, port=8080, env_file="/etc/inspection/app.env"):
     if not re.fullmatch(r"[0-9a-f]{40}", version):
         raise ValueError("version must contain the deployed 40-character Git commit SHA")
     env = load_env(env_file)
-    store = EventStore(env_file)
+    store = EventStore(env)
     started = utc_now()
 
     class Handler(BaseHTTPRequestHandler):
