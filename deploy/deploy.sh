@@ -134,10 +134,32 @@ printf "[2b/4] installing %s as root/600 through SSH stdin ...\n" "$DB_SECRET"
 "${SSH[@]}" "sudo sh -c 'umask 077; install -d -m 700 /etc/inspection; cat >> /etc/inspection/app.env; chmod 600 /etc/inspection/app.env; chown root:root /etc/inspection/app.env'" < "$DB_SECRET" \
   || die "db secret file could not be installed."
 
+# ---------------------------------------------------------------- 2d. install IoT identity files and consumer settings
+IOT_DIR="$ROOT/.local/iot"
+[ -d "$IOT_DIR" ] || die "$IOT_DIR missing. Run deploy/iot-up.sh first."
+for iot_file in endpoint AmazonRootCA1.pem consumer.cert.pem consumer.private.key; do
+  [ -f "$IOT_DIR/$iot_file" ] || die "$IOT_DIR/$iot_file missing."
+done
+CODE="$OWNER"
+printf '%s' "$CODE" | grep -qE '^[A-Za-z0-9-]{1,40}$' || die "OWNER is not a valid W06 code."
+IOT_ENDPOINT="$(tr -d '\n' < "$IOT_DIR/endpoint")"
+IOT_TOPIC="cxe/$CODE/gw/events"
+IOT_DEVICE_IDS=""
+for n in $(seq -w 1 10); do
+  IOT_DEVICE_IDS="${IOT_DEVICE_IDS}${IOT_DEVICE_IDS:+,}$CODE-d$n"
+done
+printf '[2c/4] installing IoT certificates and consumer settings ...\n'
+"${SSH[@]}" "sudo sh -c 'install -d -o inspection -g inspection -m 700 /etc/inspection/iot; chmod 755 /etc/inspection'"
+for iot_file in AmazonRootCA1.pem consumer.cert.pem consumer.private.key; do
+  "${SSH[@]}" "sudo sh -c 'umask 077; cat > /etc/inspection/iot/$iot_file; chown inspection:inspection /etc/inspection/iot/$iot_file; chmod 600 /etc/inspection/iot/$iot_file'" < "$IOT_DIR/$iot_file"
+done
+IOT_ENV=$(printf 'IOT_ENDPOINT=%s\nIOT_TOPIC=%s\nIOT_CLIENT_ID=consumer-%s\nIOT_DEVICE_IDS=%s\nIOT_CA=/etc/inspection/iot/AmazonRootCA1.pem\nIOT_CERT=/etc/inspection/iot/consumer.cert.pem\nIOT_KEY=/etc/inspection/iot/consumer.private.key\n' "$IOT_ENDPOINT" "$IOT_TOPIC" "$CODE" "$IOT_DEVICE_IDS")
+"${SSH[@]}" "sudo sh -c 'sed -i /^IOT_/d /etc/inspection/app.env; cat >> /etc/inspection/app.env; chmod 600 /etc/inspection/app.env; chown root:root /etc/inspection/app.env'" <<< "$IOT_ENV"
+
 
 # ---------------------------------------------------------------- 2c. restart so it is read
-printf '[3/4] restarting inspection so the service reads the new secrets ...\n'
-"${SSH[@]}" 'sudo systemctl restart inspection && sudo systemctl is-active inspection' \
+printf '[3/4] restarting inspection and consumer so they read the new settings ...\n'
+"${SSH[@]}" 'sudo systemctl restart inspection && sudo systemctl restart inspection-consumer && sudo systemctl is-active inspection inspection-consumer' \
   || die "inspection did not come back up."
 
 # ---------------------------------------------------------------- 3. verify

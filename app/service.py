@@ -51,6 +51,8 @@ input{padding:.3rem;min-width:22rem}
 <form id="load">
 <label for="token">operator 權杖</label>
 <input id="token" type="password" autocomplete="off" spellcheck="false" required>
+<label for="device">設備編號</label>
+<input id="device" type="text" autocomplete="off" spellcheck="false" maxlength="32">
 <button type="submit">讀取</button>
 </form>
 <p id="status"></p>
@@ -61,6 +63,7 @@ input{padding:.3rem;min-width:22rem}
 <script>
 const form = document.getElementById("load");
 const tokenInput = document.getElementById("token");
+const deviceInput = document.getElementById("device");
 const statusLine = document.getElementById("status");
 const tableBody = document.getElementById("events");
 let operatorToken = "";
@@ -73,7 +76,8 @@ form.addEventListener("submit", async function (event) {
   tableBody.replaceChildren();
   let response, data;
   try {
-    response = await fetch("/events", { headers: { Authorization: "Bearer " + operatorToken } });
+    const query = deviceInput.value.trim() ? "?device_id=" + encodeURIComponent(deviceInput.value.trim()) : "";
+    response = await fetch("/events" + query, { headers: { Authorization: "Bearer " + operatorToken } });
     data = await response.json();
   } catch (err) {
     operatorToken = "";
@@ -290,14 +294,20 @@ class EventStore:
         with self._lock:
             return self._mem.get(event_id)
 
-    def latest(self, limit=MAX_LIST):
+    def latest(self, limit=MAX_LIST, device_id=None):
         if self._db_ok and self._conn:
             try:
                 cur = self._conn.cursor()
-                cur.execute(
-                    "SELECT event_id, device_id, observed_at, type, note, received_at FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s",
-                    (limit,),
-                )
+                if device_id is None:
+                    cur.execute(
+                        "SELECT event_id, device_id, observed_at, type, note, received_at FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                        (limit,),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT event_id, device_id, observed_at, type, note, received_at FROM events WHERE device_id=%s ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                        (device_id, limit),
+                    )
                 rows = cur.fetchall()
                 cur.close()
                 out = []
@@ -316,7 +326,8 @@ class EventStore:
             except Exception:
                 pass
         with self._lock:
-            items = list(self._mem.values())
+            items = [item for item in self._mem.values()
+                     if device_id is None or item["device_id"] == device_id]
         return list(reversed(items[-limit:]))
 
 
@@ -392,7 +403,13 @@ def make_server(version_file, port=8080):
                     return self._error(401, "unauthorized", "authorization")
                 if who != "operator":
                     return self._error(403, "forbidden", "role")
-                return self._send(200, store.latest())
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query,
+                                              keep_blank_values=True)
+                values = query.get("device_id", [])
+                if len(values) > 1 or (values and not DEVICE_ID_RE.fullmatch(values[0])):
+                    return self._error(400, "invalid_value", "device_id")
+                device_id = values[0] if values else None
+                return self._send(200, store.latest(device_id=device_id))
             if route.startswith("/events/"):
                 who = self._identity()
                 if who is None:
