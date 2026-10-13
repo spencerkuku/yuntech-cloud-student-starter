@@ -10,6 +10,8 @@ import paho.mqtt.client as mqtt
 
 
 def reason_value(reason):
+    if hasattr(reason, "value"):
+        return reason.value
     try:
         return int(reason)
     except (TypeError, ValueError):

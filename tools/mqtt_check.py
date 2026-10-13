@@ -13,6 +13,15 @@ ROOT = Path(__file__).resolve().parents[1]
 IOT = ROOT / ".local" / "iot"
 
 
+def reason_value(reason):
+    if hasattr(reason, "value"):
+        return reason.value
+    try:
+        return int(reason)
+    except (TypeError, ValueError):
+        return str(reason)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--as", dest="identity", choices=("gw", "consumer"), required=True)
@@ -34,13 +43,13 @@ def main():
     completed = threading.Event()
 
     def on_connect(client, userdata, flags, reason_code, properties):
-        print(f"connack={int(reason_code)}", flush=True)
+        print(f"connack={reason_value(reason_code)}", flush=True)
         connected.set()
         if args.sub:
             client.subscribe(args.sub, qos=1)
 
     def on_subscribe(client, userdata, mid, reason_codes, properties):
-        print(f"suback={int(reason_codes[0]) if reason_codes else 128}", flush=True)
+        print(f"suback={reason_value(reason_codes[0]) if reason_codes else 128}", flush=True)
 
     def on_publish(client, userdata, mid, reason_code, properties):
         print(f"puback={int(reason_code)}", flush=True)
