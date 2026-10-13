@@ -48,7 +48,8 @@ PY
 )"
 
 scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 .local/user-data.sh "$user@$host:/tmp/inspection-user-data.sh"
-ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 "$user@$host" 'sudo bash -c "install -d -m 755 /etc/inspection ; cat > /etc/inspection/app.env <<\"EOF\"\n$(cat .local/app.env)\nEOF\nchmod 600 /etc/inspection/app.env\nchown root:root /etc/inspection/app.env\n"'
+scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 .local/app.env "$user@$host:/tmp/inspection-app.env"
+ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 "$user@$host" 'sudo install -d -m 755 /etc/inspection && sudo install -o root -g root -m 600 /tmp/inspection-app.env /etc/inspection/app.env'
 ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 "$user@$host" 'sudo bash /tmp/inspection-user-data.sh'
 sleep 2
 ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 "$user@$host" 'curl -fsS http://127.0.0.1:8080/health' >/dev/null
