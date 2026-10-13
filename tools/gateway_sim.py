@@ -7,6 +7,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 import re
+import threading
 import time
 
 try:
@@ -20,13 +21,35 @@ STATE_PATH = ROOT / ".local" / "w06-last-run.json"
 
 
 def build_event(prefix, device_id, index):
+    device_suffix = device_id.rsplit("-", 1)[-1]
     event = {
-        "event_id": f"{prefix}-{device_id}-{index:02d}",
+        "event_id": f"{prefix}-{device_suffix}-{index:02d}",
         "device_id": device_id,
-        "observed_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "+00:00"),
+        "observed_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "type": "status",
     }
     return event
+
+
+def connect_and_wait(client, endpoint, timeout=15):
+    connected = threading.Event()
+    result = {}
+
+    def on_connect(client, userdata, flags, reason_code, properties=None):
+        result["reason_code"] = getattr(reason_code, "value", reason_code)
+        connected.set()
+
+    client.on_connect = on_connect
+    client.connect(endpoint, 8883, 60)
+    client.loop_start()
+    if not connected.wait(timeout):
+        client.loop_stop()
+        client.disconnect()
+        raise TimeoutError("timed out waiting for MQTT CONNACK")
+    if result["reason_code"] != 0:
+        client.loop_stop()
+        client.disconnect()
+        raise RuntimeError(f"MQTT connection rejected with reason code {result['reason_code']}")
 
 
 def load_endpoint():
@@ -49,8 +72,7 @@ def main():
     client = mqtt.Client(client_id=f"gw-{args.code}", protocol=mqtt.MQTTv5, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
     client.tls_set(ca_certs=str(IOT_DIR / "AmazonRootCA1.pem"), certfile=str(IOT_DIR / "gw.cert.pem"), keyfile=str(IOT_DIR / "gw.private.key"))
     client.tls_insecure_set(False)
-    client.connect(endpoint, 8883, 60)
-    client.loop_start()
+    connect_and_wait(client, endpoint)
 
     count = 0
     first_event = None

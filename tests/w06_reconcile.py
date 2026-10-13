@@ -62,6 +62,8 @@ def load_last_run(prefix):
 def ssh_command(host, remote_command, stdin_path=None):
     command = [
         "ssh",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "ConnectTimeout=12",
         "-o", "StrictHostKeyChecking=accept-new",
         "-i", os.path.expanduser("~/.ssh/id_ed25519"),
         "ec2-user@" + host,
@@ -185,7 +187,7 @@ def main():
         complete = False
         for attempt in range(12):
             counts = consumer_counts(host, prefix)
-            db_rows = database_count(host, LOCAL / "db.env", prefix + "-")
+            db_rows = database_count(host, LOCAL / "db.env", prefix)
             if sum(counts.values()) >= 32 and db_rows >= 30:
                 complete = True
                 break
