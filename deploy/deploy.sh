@@ -172,7 +172,7 @@ try:
     body = json.load(sys.stdin)
 except ValueError:
     sys.exit(1)
-  sys.exit(0 if body.get("version") == sys.argv[1] and body.get("auth_configured") is True and body.get("db_configured") is True else 1)
+sys.exit(0 if body.get("version") == sys.argv[1] and body.get("auth_configured") is True and body.get("db_configured") is True else 1)
 ' "$COMMIT"; then
     printf '\nOK  version == %s, auth_configured == true, db_configured == true\n' "$COMMIT"
     printf '    %s\n' "$HEALTH"
