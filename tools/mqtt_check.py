@@ -52,7 +52,7 @@ def main():
         print(f"suback={reason_value(reason_codes[0]) if reason_codes else 128}", flush=True)
 
     def on_publish(client, userdata, mid, reason_code, properties):
-        print(f"puback={int(reason_code)}", flush=True)
+        print(f"puback={reason_value(reason_code)}", flush=True)
         completed.set()
 
     def on_message(client, userdata, message):
