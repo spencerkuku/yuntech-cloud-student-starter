@@ -25,7 +25,7 @@ endpoint = lab.run_aws(
     ["iot", "describe-endpoint", "--endpoint-type", "iot:Data-ATS",
      "--query", "endpointAddress"],
     ctx["region"], raw=True,
-)
+).strip().strip('"')
 iot = local / "iot"
 iot.joinpath("endpoint").write_text(endpoint.strip() + "\n", encoding="utf-8")
 iot.joinpath("endpoint").chmod(0o600)
