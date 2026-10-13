@@ -51,14 +51,21 @@ print('ec2-user')
 PY
 )"
 
-scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 .local/user-data.sh "$user@$host:/tmp/inspection-user-data.sh"
-scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 .local/app.env "$user@$host:/tmp/inspection-app.env"
-scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 .local/db.env "$user@$host:/tmp/inspection-db.env"
+cleanup_remote() {
+  ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 "$user@$host" \
+    'sudo rm -f /tmp/inspection-user-data.sh /tmp/inspection-app.env /tmp/inspection-db.env /tmp/AmazonRootCA1.pem /tmp/consumer.cert.pem /tmp/consumer.private.key' \
+    >/dev/null 2>&1 || true
+}
+trap cleanup_remote EXIT
+
+scp -p -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 .local/user-data.sh "$user@$host:/tmp/inspection-user-data.sh"
+scp -p -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 .local/app.env "$user@$host:/tmp/inspection-app.env"
+scp -p -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 .local/db.env "$user@$host:/tmp/inspection-db.env"
 if [[ -d .local/iot ]]; then
-  scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 .local/iot/AmazonRootCA1.pem .local/iot/consumer.cert.pem .local/iot/consumer.private.key "$user@$host:/tmp/"
+  scp -p -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 .local/iot/AmazonRootCA1.pem .local/iot/consumer.cert.pem .local/iot/consumer.private.key "$user@$host:/tmp/"
 fi
-ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 "$user@$host" 'sudo install -d -m 755 /etc/inspection && sudo install -d -o inspection -g inspection -m 700 /etc/inspection/iot && sudo install -o root -g root -m 600 /tmp/inspection-app.env /etc/inspection/app.env && sudo sh -c "cat /tmp/inspection-db.env >> /etc/inspection/app.env" && sudo chmod 600 /etc/inspection/app.env && sudo chown root:root /etc/inspection/app.env && sudo install -o inspection -g inspection -m 600 /tmp/AmazonRootCA1.pem /etc/inspection/iot/AmazonRootCA1.pem && sudo install -o inspection -g inspection -m 600 /tmp/consumer.cert.pem /etc/inspection/iot/consumer.cert.pem && sudo install -o inspection -g inspection -m 600 /tmp/consumer.private.key /etc/inspection/iot/consumer.private.key'
-ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 "$user@$host" 'sudo bash /tmp/inspection-user-data.sh'
+ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 "$user@$host" 'sudo install -d -m 755 /etc/inspection && sudo install -d -o inspection -g inspection -m 700 /etc/inspection/iot && sudo install -o root -g root -m 600 /tmp/inspection-app.env /etc/inspection/app.env && sudo sh -c "cat /tmp/inspection-db.env >> /etc/inspection/app.env" && sudo chmod 600 /etc/inspection/app.env && sudo chown root:root /etc/inspection/app.env && sudo install -o inspection -g inspection -m 600 /tmp/AmazonRootCA1.pem /etc/inspection/iot/AmazonRootCA1.pem && sudo install -o inspection -g inspection -m 600 /tmp/consumer.cert.pem /etc/inspection/iot/consumer.cert.pem && sudo install -o inspection -g inspection -m 600 /tmp/consumer.private.key /etc/inspection/iot/consumer.private.key && sudo rm -f /tmp/inspection-app.env /tmp/inspection-db.env /tmp/AmazonRootCA1.pem /tmp/consumer.cert.pem /tmp/consumer.private.key'
+ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 "$user@$host" 'sudo bash /tmp/inspection-user-data.sh; status=$?; sudo rm -f /tmp/inspection-user-data.sh; exit "$status"'
 sleep 2
 ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519 "$user@$host" 'curl -fsS http://127.0.0.1:8080/health' >/dev/null
 
