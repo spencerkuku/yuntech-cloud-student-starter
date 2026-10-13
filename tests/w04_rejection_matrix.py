@@ -102,7 +102,7 @@ def run_matrix(base_url, reporter_token, operator_token):
     record("reporter POST without timezone", 400, "POST", "/events", invalid_time_event,
            reporter_token,
            lambda payload: isinstance(payload, dict) and payload.get("field") == "observed_at")
-    record("reporter duplicate POST #1", 409, "POST", "/events", event, reporter_token)
+    record("reporter idempotent POST #1", 200, "POST", "/events", event, reporter_token)
     record("reporter GET /events", 403, "GET", "/events", token=reporter_token)
     record("operator GET /events includes #1", 200, "GET", "/events", token=operator_token,
            check=lambda payload: isinstance(payload, dict) and any(
