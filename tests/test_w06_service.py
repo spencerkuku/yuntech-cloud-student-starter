@@ -4,6 +4,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import importlib.util
@@ -29,6 +30,15 @@ class W06ServiceContract(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
         self.tmp.cleanup()
+
+    def test_database_timestamps_serialize_and_compare_as_utc(self):
+        value = datetime(2026, 10, 13, 3, 40, tzinfo=timezone.utc)
+        event = service.EventStore._row_to_event(
+            ("event-1", "device-1", value, "status", None, value)
+        )
+        self.assertEqual(event["observed_at"], "2026-10-13T03:40:00Z")
+        self.assertEqual(event["received_at"], "2026-10-13T03:40:00Z")
+        self.assertTrue(service.EventStore._same_timestamp(value, "2026-10-13T03:40:00Z"))
 
     def test_post_and_get_events_require_tokens_and_filter_devices(self):
         env = {"REPORTER_TOKEN": "reporter-secret", "OPERATOR_TOKEN": "operator-secret"}

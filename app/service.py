@@ -140,13 +140,41 @@ class EventStore:
         return self._db_ok
 
     @staticmethod
+    def _as_utc_datetime(value):
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if not isinstance(value, datetime):
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @classmethod
+    def _json_timestamp(cls, value):
+        normalized = cls._as_utc_datetime(value)
+        if normalized is None:
+            return value
+        return normalized.isoformat().replace("+00:00", "Z")
+
+    @classmethod
+    def _same_timestamp(cls, left, right):
+        left_value = cls._as_utc_datetime(left)
+        right_value = cls._as_utc_datetime(right)
+        if left_value is not None and right_value is not None:
+            return left_value == right_value
+        return left == right
+
+    @staticmethod
     def _row_to_event(row):
         event = {
             "event_id": row[0],
             "device_id": row[1],
-            "observed_at": row[2],
+            "observed_at": EventStore._json_timestamp(row[2]),
             "type": row[3],
-            "received_at": row[5],
+            "received_at": EventStore._json_timestamp(row[5]),
         }
         if row[4] is not None:
             event["note"] = row[4]
@@ -175,8 +203,11 @@ class EventStore:
                         row = cursor.fetchone()
                     if row is None:
                         return "error"
-                    same = (row[0], row[1], row[2], row[3]) == (
-                        event["device_id"], event["observed_at"], event["type"], event.get("note")
+                    same = (
+                        row[0] == event["device_id"]
+                        and self._same_timestamp(row[1], event["observed_at"])
+                        and row[2] == event["type"]
+                        and row[3] == event.get("note")
                     )
                     return "duplicate" if same else "conflict"
                 except Exception:
