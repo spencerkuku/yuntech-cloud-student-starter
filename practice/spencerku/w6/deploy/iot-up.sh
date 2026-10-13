@@ -21,7 +21,11 @@ import lab
 ctx = lab.verify()
 data = json.loads(resources_path.read_text(encoding="utf-8")) if resources_path.exists() else {}
 code = "g03-m2"
-endpoint = lab.run_aws(["iot", "describe-endpoint", "--endpoint-type", "iot:Data-ATS"], ctx["region"], raw=True)
+endpoint = lab.run_aws(
+    ["iot", "describe-endpoint", "--endpoint-type", "iot:Data-ATS",
+     "--query", "endpointAddress"],
+    ctx["region"], raw=True,
+)
 iot = local / "iot"
 iot.joinpath("endpoint").write_text(endpoint.strip() + "\n", encoding="utf-8")
 iot.joinpath("endpoint").chmod(0o600)
