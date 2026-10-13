@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
+LOCAL="$ROOT/practice/spencerku/w5/.local"
+CONFIG="$LOCAL/w5.env"
+APP_ENV="$LOCAL/app.env"
+DB_ENV="$LOCAL/db.env"
+PACKAGER="$ROOT/practice/spencerku/w5/deploy/make_user_data.py"
+
+fail() { printf 'STOP: %s\n' "$1" >&2; exit 1; }
+[[ -f "$CONFIG" ]] || fail "missing $CONFIG"
+[[ -f "$APP_ENV" ]] || fail "missing $APP_ENV"
+[[ -f "$DB_ENV" ]] || fail "missing $DB_ENV"
+mode="$(stat -c '%a' "$APP_ENV" 2>/dev/null || stat -f '%Lp' "$APP_ENV")"
+[[ "$mode" == "600" ]] || fail "$APP_ENV must have mode 600"
+mode="$(stat -c '%a' "$DB_ENV" 2>/dev/null || stat -f '%Lp' "$DB_ENV")"
+[[ "$mode" == "600" ]] || fail "$DB_ENV must have mode 600"
+
+# shellcheck disable=SC1090
+source "$CONFIG"
+: "${INSTANCE_ID:?w4.env must define INSTANCE_ID}"
+: "${SSH_USER:?w4.env must define SSH_USER}"
+: "${SSH_KEY_FILE:?w4.env must define SSH_KEY_FILE}"
+DEPLOY_COMMIT="${DEPLOY_COMMIT:-HEAD}"
+SSH_KEY_FILE="${SSH_KEY_FILE/#\~/$HOME}"
+[[ -r "$SSH_KEY_FILE" ]] || fail "SSH key is not readable"
+
+bash "$ROOT/scripts/verify-aws.sh"
+HOST_IP="$(python3 - "$ROOT" "$INSTANCE_ID" <<'PY'
+import json
+import ipaddress
+from pathlib import Path
+import sys
+import urllib.request
+
+root = Path(sys.argv[1])
+instance_id = sys.argv[2]
+resources = json.loads((root / "practice/spencerku/w3/.local/resources.json").read_text(encoding="utf-8"))
+if resources.get("instance_id") != instance_id or resources.get("owner") != "spencerku":
+  raise SystemExit("STOP: instance does not match the recorded W3 resource owner")
+sys.path.insert(0, str(root / "scripts"))
+import lab
+
+context = lab.context()
+result = lab.run_aws(["ec2", "describe-instances", "--instance-ids", instance_id], context["region"])
+instances = result.get("Reservations", [{}])[0].get("Instances", [])
+if len(instances) != 1 or instances[0].get("State", {}).get("Name") != "running":
+  raise SystemExit("STOP: recorded W3 instance is not running")
+public_ip = instances[0].get("PublicIpAddress")
+if not public_ip:
+  raise SystemExit("STOP: recorded W3 instance has no current public IP")
+source_ip = urllib.request.urlopen("https://checkip.amazonaws.com", timeout=5).read().decode().strip()
+try:
+  source_cidr = str(ipaddress.ip_address(source_ip)) + "/32"
+except ValueError as exc:
+  raise SystemExit("STOP: could not determine a valid laptop IPv4 /32") from exc
+security_group_id = resources.get("security_group_id")
+if not security_group_id:
+  raise SystemExit("STOP: recorded W3 resources have no security group ID")
+if security_group_id not in {item.get("GroupId") for item in instances[0].get("SecurityGroups", [])}:
+  raise SystemExit("STOP: recorded security group is not attached to the W3 instance")
+group = lab.run_aws(["ec2", "describe-security-groups", "--group-ids", security_group_id], context["region"])["SecurityGroups"][0]
+allowed_ports = {
+  permission.get("FromPort")
+  for permission in group.get("IpPermissions", [])
+  if permission.get("IpProtocol") == "tcp"
+  and source_cidr in {item.get("CidrIp") for item in permission.get("IpRanges", [])}
+}
+if not {22, 80}.issubset(allowed_ports):
+  raise SystemExit(f"STOP: laptop source {source_cidr} is not allowed for TCP 22 and 80 in {security_group_id}; update the reviewed SG rule, then retry")
+print(public_ip)
+PY
+)"
+
+SHA="$(git -C "$ROOT" rev-parse --verify --end-of-options "$DEPLOY_COMMIT^{commit}")"
+USER_DATA="$LOCAL/w04-user-data-$SHA.sh"
+if [[ ! -e "$USER_DATA" ]]; then
+  python3 "$PACKAGER" "$SHA" "$USER_DATA"
+fi
+printf 'Target host: %s\nCommit: %s\n' "$HOST_IP" "$SHA"
+printf 'Type APPROVE to continue: '
+read -r approval
+[[ "$approval" == "APPROVE" ]] || fail "deployment cancelled"
+
+SSH=(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 "$SSH_USER@$HOST_IP")
+"${SSH[@]}" 'sudo bash -s' < "$USER_DATA"
+"${SSH[@]}" 'sudo install -d -m 755 /etc/inspection && sudo install -o root -g root -m 600 /dev/stdin /etc/inspection/app.env' < <(cat "$APP_ENV" "$DB_ENV")
+"${SSH[@]}" 'sudo systemctl restart inspection'
+
+health="$(curl --fail --silent --show-error --max-time 10 "http://$HOST_IP/health")"
+python3 - "$SHA" "$health" <<'PY'
+import json
+import sys
+expected, raw = sys.argv[1:]
+body = json.loads(raw)
+if (body.get("version") != expected or body.get("auth_configured") is not True
+        or body.get("db_configured") is not True):
+    raise SystemExit("STOP: /health version, auth_configured, or db_configured mismatch")
+print(json.dumps({"version": body["version"], "auth_configured": body["auth_configured"],
+                  "db_configured": body["db_configured"]}))
+PY

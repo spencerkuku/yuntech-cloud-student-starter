@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set +x
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCAL_DIR="${ROOT_DIR}/.local"
 RESOURCES_PATH="${LOCAL_DIR}/resources.json"
 APP_ENV_PATH="${LOCAL_DIR}/app.env"
+DB_ENV_PATH="${LOCAL_DIR}/db.env"
 USER_DATA_PATH="${LOCAL_DIR}/w04-user-data.sh"
 COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 
@@ -35,22 +37,56 @@ env_path = Path(sys.argv[1])
 mode = stat.S_IMODE(env_path.stat().st_mode)
 if mode != 0o600:
     raise SystemExit("STOP: .local/app.env permissions must be exactly 600.")
+allowed = {
+  "REPORTER_TOKEN", "OPERATOR_TOKEN", "IOT_ENDPOINT", "IOT_TOPIC",
+  "IOT_CLIENT_ID", "IOT_DEVICE_IDS", "IOT_CA", "IOT_CERT", "IOT_KEY",
+}
 values = {}
 for line in env_path.read_text(encoding="utf-8").splitlines():
   line = line.strip()
   if not line or line.startswith("#"):
     continue
   key, separator, value = line.partition("=")
-  if not separator or key not in {"REPORTER_TOKEN", "OPERATOR_TOKEN"} or key in values:
-    raise SystemExit("STOP: .local/app.env must contain the two W4 token settings.")
+  if not separator or key not in allowed or key in values:
+    raise SystemExit("STOP: .local/app.env contains an unknown or duplicate setting.")
   value = value.strip()
   if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
     value = value[1:-1]
-  if not value or re.search(r"\s", value):
-    raise SystemExit("STOP: .local/app.env contains an empty or invalid token setting.")
+  if not value or (key.endswith("_TOKEN") and re.search(r"\s", value)):
+    raise SystemExit("STOP: .local/app.env contains an empty or invalid setting.")
   values[key] = value
-if set(values) != {"REPORTER_TOKEN", "OPERATOR_TOKEN"}:
+tokens = {"REPORTER_TOKEN", "OPERATOR_TOKEN"}
+iot_settings = {"IOT_ENDPOINT", "IOT_TOPIC", "IOT_CLIENT_ID", "IOT_DEVICE_IDS",
+                "IOT_CA", "IOT_CERT", "IOT_KEY"}
+if not tokens <= values.keys() or (values.keys() & iot_settings and
+                                   not iot_settings <= values.keys()):
   raise SystemExit("STOP: .local/app.env must contain the two W4 token settings.")
+PY
+
+if [[ ! -f "$DB_ENV_PATH" || -L "$DB_ENV_PATH" ]]; then
+  echo 'STOP: .local/db.env is missing or not a regular file.' >&2
+  exit 1
+fi
+python3 - "$DB_ENV_PATH" <<'PY'
+import stat
+import sys
+from pathlib import Path
+
+env_path = Path(sys.argv[1])
+if stat.S_IMODE(env_path.stat().st_mode) != 0o600:
+    raise SystemExit("STOP: .local/db.env permissions must be exactly 600.")
+required = {"DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"}
+values = {}
+for line in env_path.read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    key, separator, value = line.partition("=")
+    if not separator or key not in required or key in values or not value.strip():
+        raise SystemExit("STOP: .local/db.env has an invalid or duplicate setting.")
+    values[key] = value.strip()
+if values.keys() != required:
+    raise SystemExit("STOP: .local/db.env must contain all four DB settings.")
 PY
 
 if [[ ! -f "$RESOURCES_PATH" || -L "$RESOURCES_PATH" ]]; then
@@ -76,16 +112,17 @@ if ! git -C "$ROOT_DIR" cat-file -e "${COMMIT}^{commit}" 2>/dev/null; then
 fi
 
 bash "$ROOT_DIR/deploy/make-user-data.sh" "$COMMIT" "$USER_DATA_PATH"
-python3 - "$APP_ENV_PATH" "$USER_DATA_PATH" <<'PY'
+python3 - "$APP_ENV_PATH" "$DB_ENV_PATH" "$USER_DATA_PATH" <<'PY'
 import sys
 from pathlib import Path
 
-env_path, user_data_path = map(Path, sys.argv[1:])
+app_env_path, db_env_path, user_data_path = map(Path, sys.argv[1:])
 secrets = []
-for line in env_path.read_text(encoding="utf-8").splitlines():
+for env_path in (app_env_path, db_env_path):
+  for line in env_path.read_text(encoding="utf-8").splitlines():
     key, separator, value = line.partition("=")
-    if separator and key in {"REPORTER_TOKEN", "OPERATOR_TOKEN"} and value:
-        secrets.append(value.encode("utf-8"))
+    if separator and value:
+      secrets.append(value.encode("utf-8"))
 payload = user_data_path.read_bytes()
 if any(secret in payload for secret in secrets):
     raise SystemExit("STOP: app.env secret detected in generated user data.")
@@ -161,7 +198,7 @@ if stat.S_IMODE(Path(sys.argv[1]).stat().st_mode) != 0o600:
     raise SystemExit("STOP: SSH private key permissions must be exactly 600.")
 PY
 
-printf 'W4 deployment target\n'
+printf 'W5 deployment target\n'
 printf 'Region: %s\n' "$REGION"
 printf 'Instance: %s\n' "$INSTANCE_ID"
 if [[ "$INSTANCE_STATE" == "running" ]]; then
@@ -174,8 +211,8 @@ if [[ ! -t 0 ]]; then
   echo 'STOP: interactive confirmation is required; no deployment started.' >&2
   exit 1
 fi
-read -r -p "Type 'DEPLOY W4' to continue: " approval
-if [[ "$approval" != 'DEPLOY W4' ]]; then
+read -r -p "Type 'DEPLOY W5' to continue: " approval
+if [[ "$approval" != 'DEPLOY W5' ]]; then
   echo 'Cancelled; no deployment started.' >&2
   exit 1
 fi
@@ -229,9 +266,12 @@ printf 'Refreshed SSH target: ec2-user@%s\n' "$PUBLIC_IP"
 SSH_OPTIONS=(-i "$KEY_PATH" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10)
 ssh "${SSH_OPTIONS[@]}" "ec2-user@${PUBLIC_IP}" 'sudo bash -s' < "$USER_DATA_PATH"
 
-REMOTE_INSTALL_COMMAND='sudo install -d -o root -g root -m 755 /etc/inspection && sudo tee /etc/inspection/app.env >/dev/null && sudo chown root:root /etc/inspection/app.env && sudo chmod 600 /etc/inspection/app.env && sudo install -d -o root -g root -m 755 /etc/systemd/system/inspection.service.d && printf "%s\n" "[Service]" "EnvironmentFile=/etc/inspection/app.env" | sudo tee /etc/systemd/system/inspection.service.d/app-env.conf >/dev/null && sudo chown root:root /etc/systemd/system/inspection.service.d/app-env.conf && sudo chmod 644 /etc/systemd/system/inspection.service.d/app-env.conf && test "$(sudo stat -c %U:%G:%a /etc/inspection/app.env)" = "root:root:600"'
+REMOTE_INSTALL_COMMAND='sudo install -d -o root -g root -m 755 /etc/inspection && sudo chmod 755 /etc/inspection && sudo install -d -o inspection -g inspection -m 700 /etc/inspection/iot && sudo tee /etc/inspection/app.env >/dev/null && sudo chown root:root /etc/inspection/app.env && sudo chmod 600 /etc/inspection/app.env && sudo install -d -o root -g root -m 755 /etc/systemd/system/inspection.service.d && printf "%s\n" "[Service]" "EnvironmentFile=/etc/inspection/app.env" | sudo tee /etc/systemd/system/inspection.service.d/app-env.conf >/dev/null && sudo chown root:root /etc/systemd/system/inspection.service.d/app-env.conf && sudo chmod 644 /etc/systemd/system/inspection.service.d/app-env.conf && test "$(sudo stat -c %U:%G:%a /etc/inspection)" = "root:root:755" && test "$(sudo stat -c %U:%G:%a /etc/inspection/iot)" = "inspection:inspection:700" && test "$(sudo stat -c %U:%G:%a /etc/inspection/app.env)" = "root:root:600"'
 ssh "${SSH_OPTIONS[@]}" "ec2-user@${PUBLIC_IP}" "$REMOTE_INSTALL_COMMAND" < "$APP_ENV_PATH"
 printf 'Remote app.env owner and mode verified: root:root 600\n'
+REMOTE_DB_COMMAND="sudo sh -c 'umask 077; cat >> /etc/inspection/app.env; chown root:root /etc/inspection/app.env; chmod 600 /etc/inspection/app.env'"
+ssh "${SSH_OPTIONS[@]}" "ec2-user@${PUBLIC_IP}" "$REMOTE_DB_COMMAND" < "$DB_ENV_PATH"
+printf 'Remote DB settings installed without printing values.\n'
 ssh "${SSH_OPTIONS[@]}" "ec2-user@${PUBLIC_IP}" 'sudo systemctl daemon-reload && sudo systemctl restart inspection && systemctl is-active --quiet inspection'
 
 HEALTH_PATH="$(mktemp "${TMPDIR:-/tmp}/w04-health.XXXXXX")"
@@ -249,7 +289,9 @@ except (OSError, json.JSONDecodeError):
 if health.get("version") != expected_version:
     raise SystemExit("STOP: health version does not match the deployed commit.")
 if health.get("auth_configured") is not True:
-    raise SystemExit("STOP: health endpoint reports auth_configured=false.")
-print("Health verified: version matches commit and auth_configured=true.")
+  raise SystemExit("STOP: health endpoint reports auth_configured=false.")
+if health.get("db_configured") is not True:
+  raise SystemExit("STOP: health endpoint reports db_configured=false.")
+print("Health verified: version, auth and database configuration match.")
 PY
-printf 'W4 deployment complete for instance %s at %s.\n' "$INSTANCE_ID" "$PUBLIC_IP"
+printf 'W5 deployment complete for instance %s at %s.\n' "$INSTANCE_ID" "$PUBLIC_IP"
