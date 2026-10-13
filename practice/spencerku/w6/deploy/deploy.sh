@@ -91,7 +91,7 @@ COPYFILE_DISABLE=1 tar --format=ustar --exclude='._*' -cf - -C "$IOT_DIR" endpoi
   "${SSH[@]}" 'umask 077; sudo install -d -o inspection -g inspection -m 700 /etc/inspection/iot && sudo tar -xf - -C /etc/inspection/iot && sudo find /etc/inspection/iot -maxdepth 1 -type f -exec chown inspection:inspection {} + -exec chmod 600 {} +'
 "${SSH[@]}" 'sudo install -d -m 755 /etc/inspection && sudo install -o root -g root -m 600 /dev/stdin /etc/inspection/app.env' < <(
   cat "$APP_ENV" "$DB_ENV"
-  printf 'IOT_ENDPOINT=%s\nIOT_TOPIC=cxe/g03-m2/gw/events\nIOT_CLIENT_ID=consumer-g03-m2\nIOT_DEVICE_IDS='
+  printf 'IOT_ENDPOINT=%s\nIOT_TOPIC=cxe/g03-m2/gw/events\nIOT_CLIENT_ID=consumer-g03-m2\nIOT_DEVICE_IDS=' "$(cat "$IOT_DIR/endpoint")"
   printf 'g03-m2-d%02d,' $(seq 1 10)
   printf '\nIOT_CA=/etc/inspection/iot/AmazonRootCA1.pem\nIOT_CERT=/etc/inspection/iot/consumer.cert.pem\nIOT_KEY=/etc/inspection/iot/consumer.private.key\n'
 )
