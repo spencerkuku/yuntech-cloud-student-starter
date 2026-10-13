@@ -87,8 +87,8 @@ read -r approval
 
 SSH=(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 "$SSH_USER@$HOST_IP")
 "${SSH[@]}" 'sudo bash -s' < "$USER_DATA"
-COPYFILE_DISABLE=1 tar --format=ustar -cf - -C "$IOT_DIR" endpoint AmazonRootCA1.pem consumer.cert.pem consumer.private.key |
-  "${SSH[@]}" 'umask 077; sudo install -d -o inspection -g inspection -m 700 /etc/inspection/iot && sudo tar -xf - -C /etc/inspection/iot && sudo chown inspection:inspection /etc/inspection/iot/* && sudo chmod 600 /etc/inspection/iot/*'
+COPYFILE_DISABLE=1 tar --format=ustar --exclude='._*' -cf - -C "$IOT_DIR" endpoint AmazonRootCA1.pem consumer.cert.pem consumer.private.key |
+  "${SSH[@]}" 'umask 077; sudo install -d -o inspection -g inspection -m 700 /etc/inspection/iot && sudo tar -xf - -C /etc/inspection/iot && sudo find /etc/inspection/iot -maxdepth 1 -type f -exec chown inspection:inspection {} + -exec chmod 600 {} +'
 "${SSH[@]}" 'sudo install -d -m 755 /etc/inspection && sudo install -o root -g root -m 600 /dev/stdin /etc/inspection/app.env' < <(
   cat "$APP_ENV" "$DB_ENV"
   printf 'IOT_ENDPOINT=%s\nIOT_TOPIC=cxe/g03-m2/gw/events\nIOT_CLIENT_ID=consumer-g03-m2\nIOT_DEVICE_IDS='
