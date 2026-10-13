@@ -13,8 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 IOT = ROOT / ".local" / "iot"
 
 
-def load_config(role):
-    code = "g03-m2"
+def load_config(role, code):
     return {
         "endpoint": (IOT / "endpoint").read_text(encoding="utf-8").strip(),
         "ca": IOT / "AmazonRootCA1.pem",
@@ -24,8 +23,8 @@ def load_config(role):
     }
 
 
-def client_for(role):
-    config = load_config(role)
+def client_for(role, code):
+    config = load_config(role, code)
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         client_id=config["client_id"],
@@ -41,25 +40,29 @@ def client_for(role):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--code", default="g03-m2")
     parser.add_argument("--as", dest="role", choices=("gw", "consumer"), required=True)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--pub")
     group.add_argument("--sub")
     parser.add_argument("--wait", type=float, default=10)
     args = parser.parse_args()
-    client = client_for(args.role)
+    client = client_for(args.role, args.code)
     connected = threading.Event()
     pubacks = {}
 
+    def code_value(reason_code):
+        return getattr(reason_code, "value", reason_code)
+
     def on_connect(_client, _userdata, _flags, reason_code, _properties):
-        print(f"connack={reason_code}", flush=True)
+        print(f"connack={code_value(reason_code)}", flush=True)
         connected.set()
 
     def on_publish(_client, _userdata, mid, reason_code, _properties):
-        pubacks[mid] = reason_code
+        pubacks[mid] = code_value(reason_code)
 
     def on_subscribe(_client, _userdata, _mid, reason_codes, _properties):
-        print(f"suback={reason_codes[0]}", flush=True)
+        print(f"suback={code_value(reason_codes[0])}", flush=True)
 
     def on_message(_client, _userdata, message):
         print(f"recv topic={message.topic} payload={message.payload.decode('utf-8')}", flush=True)
@@ -68,7 +71,7 @@ def main():
     client.on_publish = on_publish
     client.on_subscribe = on_subscribe
     client.on_message = on_message
-    config = load_config(args.role)
+    config = load_config(args.role, args.code)
     client.connect(config["endpoint"], 8883, 60)
     client.loop_start()
     if not connected.wait(10):

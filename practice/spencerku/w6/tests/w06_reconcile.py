@@ -67,8 +67,9 @@ def main():
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         logs = subprocess.run(ssh + [log_command], capture_output=True, text=True, check=False).stdout
-        counts = dict(re.findall(r"\s*(\d+)\s+result=(created|duplicate|rejected|error)", logs))
-        total = sum(int(value) for value in counts.values())
+        matches = re.findall(r"\s*(\d+)\s+result=(created|duplicate|rejected|error)", logs)
+        counts = {result: int(count) for count, result in matches}
+        total = sum(counts.values())
         if total >= 32:
             break
         time.sleep(5)

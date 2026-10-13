@@ -54,15 +54,21 @@ def main():
     for number in range(1, 4):
         for device in range(1, 11):
             events.append((f"{prefix}-d{device:02d}-{number:02d}", f"{args.code}-d{device:02d}"))
-    events.append((f"{prefix}-d01-01", f"{args.code}-d01"))
-    events.append((f"{prefix}-d99-01", f"{args.code}-d99"))
-    ok = 0
+    payloads = []
     for event_id, device_id in events:
-        payload = {
+        payloads.append({
             "event_id": event_id, "device_id": device_id,
             "observed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "type": "status",
-        }
+        })
+    payloads.append(dict(payloads[0]))
+    payloads.append({
+        "event_id": f"{prefix}-d99-01", "device_id": f"{args.code}-d99",
+        "observed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "type": "status",
+    })
+    ok = 0
+    for payload in payloads:
         info = client.publish(f"cxe/{args.code}/gw/events", json.dumps(payload), qos=1)
         deadline = time.monotonic() + 10
         while info.mid not in acknowledgements and time.monotonic() < deadline:
@@ -70,7 +76,7 @@ def main():
         if acknowledgements.get(info.mid) == 0:
             ok += 1
         else:
-            raise RuntimeError(f"PUBACK failed for {event_id}")
+            raise RuntimeError(f"PUBACK failed for {payload['event_id']}")
     client.disconnect()
     client.loop_stop()
     print(f"puback_ok={ok}/32")

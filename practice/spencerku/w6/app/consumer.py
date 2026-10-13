@@ -62,7 +62,9 @@ def main():
         if result != mqtt.MQTT_ERR_SUCCESS:
             print(f"subscribe failed rc={result}", flush=True)
             return
-        print("subscribed rc=1", flush=True)
+
+    def on_subscribe(_mqtt_client, _userdata, _mid, reason_codes, _properties):
+        print(f"subscribed rc={getattr(reason_codes[0], 'value', reason_codes[0])}", flush=True)
 
     def on_message(_mqtt_client, _userdata, message):
         try:
@@ -85,6 +87,7 @@ def main():
         print(f"event_id={event_id} result={result}", flush=True)
 
     client.on_connect = on_connect
+    client.on_subscribe = on_subscribe
     client.on_message = on_message
     client.connect(config["IOT_ENDPOINT"], 8883, keepalive=60)
     client.loop_forever()

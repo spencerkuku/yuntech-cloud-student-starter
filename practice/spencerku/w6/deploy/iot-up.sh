@@ -89,15 +89,17 @@ policies = {
     }),
 }
 for key, (name, document) in policies.items():
-    if not data.get(key):
+    policy_created = not data.get(key)
+    if policy_created:
         result = lab.run_aws(["iot", "create-policy", "--policy-name", name,
                               "--policy-document", json.dumps(document)], ctx["region"])
         data[key] = name
         save()
     certificate_id = data["iot_gw_cert_id" if key == "iot_gw_policy" else "iot_consumer_cert_id"]
     certificate_arn = f"{base}:cert/{certificate_id}"
-    lab.run_aws(["iot", "attach-policy", "--policy-name", name,
-                 "--target", certificate_arn], ctx["region"])
+    if policy_created:
+        lab.run_aws(["iot", "attach-policy", "--policy-name", name,
+                     "--target", certificate_arn], ctx["region"])
 data["week"] = "w06"; data["status"] = "iot-ready"; save()
 for role in ("gw", "consumer"):
     status = lab.run_aws(
