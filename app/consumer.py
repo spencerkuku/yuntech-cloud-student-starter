@@ -55,14 +55,17 @@ class Consumer:
         self.key = os.environ.get("IOT_KEY", "")
         self.reporter_token = os.environ.get("REPORTER_TOKEN", "")
         self.allowed = set(parse_device_ids(os.environ.get("IOT_DEVICE_IDS", "")))
-        self.client = mqtt.Client(client_id=self.client_id, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+        self.client = mqtt.Client(client_id=self.client_id, protocol=mqtt.MQTTv5, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
         if reason_code == 0:
-            result, mid = client.subscribe(self.topic, qos=1)
-            print(f"subscribed rc={result if isinstance(result, int) else 1}")
+            client.subscribe(self.topic, qos=1)
         else:
-            print(f"subscribed rc={reason_code}")
+            print(f"subscribed rc={reason_code}", flush=True)
+
+    def _on_subscribe(self, client, userdata, mid, reason_code_list, properties=None):
+        reason_code = reason_code_list[0] if reason_code_list else "missing"
+        print(f"subscribed rc={getattr(reason_code, 'value', reason_code)}", flush=True)
 
     def _on_message(self, client, userdata, message):
         try:
@@ -72,7 +75,7 @@ class Consumer:
         event_id = payload.get("event_id", "unknown")
         device_id = payload.get("device_id", "")
         if device_id not in self.allowed:
-            print(f"event_id={event_id} result=rejected")
+            print(f"event_id={event_id} result=rejected", flush=True)
             return
         status, body = send_event(payload, self.reporter_token)
         if status == 201:
@@ -83,13 +86,14 @@ class Consumer:
             result = "rejected"
         else:
             result = "error"
-        print(f"event_id={event_id} result={result}")
+        print(f"event_id={event_id} result={result}", flush=True)
 
     def run(self):
         if not self.endpoint or not self.topic or not self.ca or not self.cert or not self.key:
             print("consumer not configured", file=sys.stderr)
             return 1
         self.client.on_connect = self._on_connect
+        self.client.on_subscribe = self._on_subscribe
         self.client.on_message = self._on_message
         self.client.tls_set(ca_certs=self.ca, certfile=self.cert, keyfile=self.key)
         self.client.tls_insecure_set(False)

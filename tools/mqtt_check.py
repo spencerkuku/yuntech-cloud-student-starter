@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -49,28 +50,34 @@ class Checker:
         self.target = target
         self.wait_seconds = wait_seconds
         self.message_seen = False
-        self.client = mqtt.Client(client_id=role_paths(role)["client_id"], callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+        self.client = mqtt.Client(client_id=role_paths(role)["client_id"], protocol=mqtt.MQTTv5, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
         self.client.on_connect = self.on_connect
         self.client.on_publish = self.on_publish
+        self.client.on_subscribe = self.on_subscribe
         self.client.on_message = self.on_message
         self.client.tls_set(ca_certs=str(IOT_DIR / "AmazonRootCA1.pem"), certfile=str(role_paths(role)["cert"]), keyfile=str(role_paths(role)["key"]))
         self.client.tls_insecure_set(False)
+        self.publish_event = threading.Event()
+
+    @staticmethod
+    def reason_value(reason_code):
+        return getattr(reason_code, "value", reason_code)
 
     def on_connect(self, client, userdata, flags, reason_code, properties=None):
-        print(f"connack={reason_code}")
+        print(f"connack={self.reason_value(reason_code)}")
         if self.target.kind == "sub":
-            result, mid = client.subscribe(self.target.topic, qos=1)
-            print(f"suback={result}")
+            client.subscribe(self.target.topic, qos=1)
         elif self.target.kind == "pub":
-            payload = json.dumps({"check": "t2", "code": os.environ.get("CODE", "local")}).encode("utf-8")
-            info = client.publish(self.target.topic, payload, qos=1)
-            if info.rc == mqtt.MQTT_ERR_SUCCESS:
-                print(f"puback={info.rc}")
-            else:
-                print(f"puback={info.rc}")
+            payload = json.dumps({"check": "t2", "code": os.environ.get("CODE", "local")})
+            client.publish(self.target.topic, payload, qos=1)
 
-    def on_publish(self, client, userdata, mid):
-        print(f"puback=0 mid={mid}")
+    def on_publish(self, client, userdata, mid, reason_code=None, properties=None):
+        print(f"puback={self.reason_value(reason_code)}")
+        self.publish_event.set()
+
+    def on_subscribe(self, client, userdata, mid, reason_code_list, properties=None):
+        codes = [self.reason_value(code) for code in reason_code_list]
+        print(f"suback={codes[0] if codes else 'missing'}")
 
     def on_message(self, client, userdata, message):
         print(f"recv topic={message.topic} payload={message.payload.decode('utf-8', 'replace')}")
@@ -79,8 +86,11 @@ class Checker:
     def run(self):
         self.client.connect(load_endpoint(), 8883, 60)
         self.client.loop_start()
-        time.sleep(self.wait_seconds)
-        self.client.loop_stop(force=True)
+        if self.target.kind == "pub":
+            self.publish_event.wait(self.wait_seconds)
+        else:
+            time.sleep(self.wait_seconds)
+        self.client.loop_stop()
         self.client.disconnect()
 
 

@@ -46,30 +46,38 @@ def main():
         raise SystemExit("run prefix must match ^[A-Za-z0-9-]{1,40}$")
 
     endpoint = load_endpoint()
-    client = mqtt.Client(client_id=f"gw-{args.code}", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    client = mqtt.Client(client_id=f"gw-{args.code}", protocol=mqtt.MQTTv5, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
     client.tls_set(ca_certs=str(IOT_DIR / "AmazonRootCA1.pem"), certfile=str(IOT_DIR / "gw.cert.pem"), keyfile=str(IOT_DIR / "gw.private.key"))
     client.tls_insecure_set(False)
     client.connect(endpoint, 8883, 60)
     client.loop_start()
 
     count = 0
+    first_event = None
+
+    def publish_and_wait(event):
+        nonlocal count
+        info = client.publish(f"cxe/{args.code}/gw/events", json.dumps(event), qos=1)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError(f"publish failed with rc={info.rc}")
+        info.wait_for_publish(timeout=10)
+        if not info.is_published():
+            raise TimeoutError("timed out waiting for PUBACK")
+        count += 1
+
     for device_index in range(1, 11):
         device_id = f"{args.code}-d{device_index:02d}"
         for event_index in range(1, 4):
             event = build_event(prefix, device_id, event_index)
-            client.publish(f"cxe/{args.code}/gw/events", json.dumps(event), qos=1)
-            count += 1
+            if device_index == 1 and event_index == 1:
+                first_event = event
+            publish_and_wait(event)
             time.sleep(0.1)
     # duplicate the first event and send an extra invalid-device event
-    dup = build_event(prefix, f"{args.code}-d01", 1)
-    client.publish(f"cxe/{args.code}/gw/events", json.dumps(dup), qos=1)
-    count += 1
+    publish_and_wait(first_event)
     invalid = build_event(prefix, f"{args.code}-d99", 1)
-    client.publish(f"cxe/{args.code}/gw/events", json.dumps(invalid), qos=1)
-    count += 1
-
-    time.sleep(1)
-    client.loop_stop(force=True)
+    publish_and_wait(invalid)
+    client.loop_stop()
     client.disconnect()
 
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)

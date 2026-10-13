@@ -6,11 +6,20 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
+import threading
+import urllib.parse
 from urllib.parse import parse_qs, urlparse
+
+try:
+    import psycopg2
+except Exception:
+    psycopg2 = None
 
 
 EVENT_STORE = {}
 TOKENS = {"REPORTER_TOKEN": "reporter-token", "OPERATOR_TOKEN": "operator-token"}
+MAX_LIST = 50
 
 
 def load_env(env=None):
@@ -86,12 +95,150 @@ def _event_sort_key(event):
         return datetime.fromtimestamp(0, timezone.utc)
 
 
+class EventStore:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._memory = {}
+        self._connection = None
+        self._db_ok = False
+        self._init_db()
+
+    def _init_db(self):
+        required = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
+        if psycopg2 is None or not all(os.environ.get(key) for key in required):
+            return
+        try:
+            connection = psycopg2.connect(
+                host=os.environ["DB_HOST"],
+                dbname=os.environ["DB_NAME"],
+                user=os.environ["DB_USER"],
+                password=os.environ["DB_PASSWORD"],
+                sslmode="verify-full",
+                sslrootcert="/etc/inspection/rds-ca.pem",
+                connect_timeout=5,
+            )
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS events (
+                        event_id TEXT PRIMARY KEY,
+                        device_id TEXT NOT NULL,
+                        observed_at TEXT NOT NULL,
+                        type TEXT NOT NULL,
+                        note TEXT,
+                        received_at TEXT NOT NULL
+                    )
+                """)
+            connection.commit()
+            self._connection = connection
+            self._db_ok = True
+        except Exception:
+            self._db_ok = False
+            if "connection" in locals():
+                connection.close()
+
+    def db_configured(self):
+        return self._db_ok
+
+    @staticmethod
+    def _row_to_event(row):
+        event = {
+            "event_id": row[0],
+            "device_id": row[1],
+            "observed_at": row[2],
+            "type": row[3],
+            "received_at": row[5],
+        }
+        if row[4] is not None:
+            event["note"] = row[4]
+        return event
+
+    def add(self, event):
+        with self._lock:
+            if self._db_ok:
+                try:
+                    with self._connection.cursor() as cursor:
+                        cursor.execute(
+                            "INSERT INTO events (event_id, device_id, observed_at, type, note, received_at) "
+                            "VALUES (%s, %s, %s, %s, %s, %s)",
+                            (event["event_id"], event["device_id"], event["observed_at"],
+                             event["type"], event.get("note"), event["received_at"]),
+                        )
+                    self._connection.commit()
+                    return "created"
+                except psycopg2.IntegrityError:
+                    self._connection.rollback()
+                    with self._connection.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT device_id, observed_at, type, note FROM events WHERE event_id = %s",
+                            (event["event_id"],),
+                        )
+                        row = cursor.fetchone()
+                    if row is None:
+                        return "error"
+                    same = (row[0], row[1], row[2], row[3]) == (
+                        event["device_id"], event["observed_at"], event["type"], event.get("note")
+                    )
+                    return "duplicate" if same else "conflict"
+                except Exception:
+                    self._connection.rollback()
+                    return "error"
+
+            existing = self._memory.get(event["event_id"])
+            if existing is not None:
+                same = all(existing.get(key) == event.get(key) for key in ("device_id", "observed_at", "type", "note"))
+                return "duplicate" if same else "conflict"
+            self._memory[event["event_id"]] = event
+            return "created"
+
+    def get(self, event_id):
+        with self._lock:
+            if self._db_ok:
+                try:
+                    with self._connection.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT event_id, device_id, observed_at, type, note, received_at FROM events WHERE event_id = %s",
+                            (event_id,),
+                        )
+                        row = cursor.fetchone()
+                    return self._row_to_event(row) if row else None
+                except Exception:
+                    return None
+            return self._memory.get(event_id)
+
+    def latest(self, limit=MAX_LIST, device_id=None):
+        with self._lock:
+            if self._db_ok:
+                try:
+                    with self._connection.cursor() as cursor:
+                        if device_id:
+                            cursor.execute(
+                                "SELECT event_id, device_id, observed_at, type, note, received_at FROM events "
+                                "WHERE device_id = %s ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                                (device_id, limit),
+                            )
+                        else:
+                            cursor.execute(
+                                "SELECT event_id, device_id, observed_at, type, note, received_at FROM events "
+                                "ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                                (limit,),
+                            )
+                        rows = cursor.fetchall()
+                    return [self._row_to_event(row) for row in rows]
+                except Exception:
+                    return []
+            rows = list(self._memory.values())
+            if device_id:
+                rows = [row for row in rows if row.get("device_id") == device_id]
+            return sorted(rows, key=_event_sort_key, reverse=True)[:limit]
+
+
 def make_server(version_file, port=8080):
     load_env()
     version = Path(version_file).read_text(encoding="utf-8").strip()
     if not re.fullmatch(r"[0-9a-f]{40}", version):
         raise ValueError("version must contain the deployed 40-character Git commit SHA")
     started = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    store = EventStore()
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
@@ -172,7 +319,7 @@ def make_server(version_file, port=8080):
                     "version": version,
                     "started_at": started,
                     "auth_configured": bool(TOKENS["REPORTER_TOKEN"]) and bool(TOKENS["OPERATOR_TOKEN"]),
-                    "db_configured": False,
+                    "db_configured": store.db_configured(),
                 })
                 return
 
@@ -186,10 +333,7 @@ def make_server(version_file, port=8080):
                     self._send_json(401, {"error": "unauthorized", "field": "Authorization"})
                     return
                 device_id = params.get("device_id", [None])[0]
-                rows = list(EVENT_STORE.values())
-                if device_id:
-                    rows = [row for row in rows if row.get("device_id") == device_id]
-                rows = sorted(rows, key=_event_sort_key, reverse=True)[:50]
+                rows = store.latest(limit=50, device_id=device_id)
                 self._send_json(200, rows)
                 return
 
@@ -199,7 +343,7 @@ def make_server(version_file, port=8080):
                     self._send_json(401, {"error": "unauthorized", "field": "Authorization"})
                     return
                 event_id = path.split("/events/", 1)[1]
-                row = EVENT_STORE.get(event_id)
+                row = store.get(event_id)
                 if row is None:
                     self._send_json(404, {"error": "not_found", "field": "event_id"})
                     return
@@ -225,16 +369,18 @@ def make_server(version_file, port=8080):
                     self._send_json(400, {"error": reason, "field": field})
                     return
 
-                existing = EVENT_STORE.get(payload["event_id"])
-                if existing is not None:
-                    if existing == {**payload, "received_at": existing["received_at"]}:
-                        self._send_json(200, existing)
-                        return
+                event = {**payload, "received_at": _utc_now_iso()}
+                result = store.add(event)
+                if result == "duplicate":
+                    existing = store.get(payload["event_id"])
+                    self._send_json(200, existing)
+                    return
+                if result == "conflict":
                     self._send_json(409, {"error": "duplicate_event_id", "field": "event_id"})
                     return
-
-                event = {**payload, "received_at": _utc_now_iso()}
-                EVENT_STORE[payload["event_id"]] = event
+                if result == "error":
+                    self._send_json(503, {"error": "storage_unavailable"})
+                    return
                 self._send_json(201, event)
                 return
 
