@@ -65,10 +65,13 @@ for attempt in $(seq 1 12); do
   rejected=$(printf '%s\n' "$counts" | awk '$2 == "result=rejected" {print $1+0}')
   error=$(printf '%s\n' "$counts" | awk '$2 == "result=error" {print $1+0}')
   created=${created:-0}; duplicate=${duplicate:-0}; rejected=${rejected:-0}; error=${error:-0}
-  db=$(sudo bash -c 'set -a; . /etc/inspection/app.env; set +a; PGPASSWORD="$DB_PASSWORD" psql "host=$DB_HOST dbname=$DB_NAME user=$DB_USER sslmode=verify-full sslrootcert=/etc/inspection/rds-ca.pem" -v prefix="$1-" -At <<"SQL"
+    set -a
+    . /etc/inspection/app.env
+    set +a
+    db=$(PGPASSWORD="$DB_PASSWORD" psql "host=$DB_HOST dbname=$DB_NAME user=$DB_USER sslmode=verify-full sslrootcert=/etc/inspection/rds-ca.pem" -v prefix="$PREFIX" -At <<"SQL"
 SELECT count(*) FROM events WHERE left(event_id, length(:'prefix')) = :'prefix';
 SQL
-' _ "$1" 2>/dev/null | tail -1)
+    2>/dev/null | tail -1)
   printf 'consumer: created=%s duplicate=%s rejected=%s error=%s db=%s\n' "$created" "$duplicate" "$rejected" "$error" "${db:-?}"
   total=$((created + duplicate + rejected + error))
   if [ "$total" -ge 32 ]; then exit 0; fi
