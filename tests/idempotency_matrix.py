@@ -5,6 +5,8 @@ import subprocess
 import sys
 import time
 import uuid
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 RES = ROOT / ".local" / "resources.json"
@@ -44,64 +46,122 @@ def get_tokens():
 
 
 def curl_json(url, method="GET", headers=None, data=None, timeout=10):
-    command = ["curl", "-sS", "--max-time", str(timeout), "-w", "|%{http_code}"]
-    if method == "POST":
-        command += ["-X", "POST", "-H", "Content-Type: application/json"]
-    for key, value in (headers or {}).items():
-        command += ["-H", f"{key}: {value}"]
-    if data is not None:
-        command += ["-d", json.dumps(data)]
-    command.append(url)
-    result = subprocess.run(command, capture_output=True, text=True)
-    body, _, code = result.stdout.rpartition("|")
+    request_headers = dict(headers or {})
+    body = json.dumps(data).encode("utf-8") if data is not None else None
+    if body is not None:
+        request_headers["Content-Type"] = "application/json"
+    request = Request(url, data=body, headers=request_headers, method=method)
     try:
-        parsed = json.loads(body) if body else {}
-    except json.JSONDecodeError:
-        parsed = body
-    return int(code) if code.isdigit() else 0, parsed
+        with urlopen(request, timeout=timeout) as response:
+            status, payload = response.status, response.read()
+    except HTTPError as error:
+        status, payload = error.code, error.read()
+    except (OSError, URLError, TimeoutError):
+        return 0, {}
+    try:
+        parsed = json.loads(payload.decode("utf-8")) if payload else {}
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        parsed = {}
+    return status, parsed
+
+
+def redact(value, secrets_to_redact):
+    if isinstance(value, dict):
+        return {redact(key, secrets_to_redact): redact(item, secrets_to_redact)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact(item, secrets_to_redact) for item in value]
+    if isinstance(value, str):
+        for secret in secrets_to_redact:
+            if secret:
+                value = value.replace(secret, "[REDACTED]")
+    return value
+
+
+def matrix_passed(health_status, health, rows):
+    return (
+        health_status == 200
+        and isinstance(health, dict)
+        and isinstance(health.get("version"), str)
+        and bool(health["version"])
+        and health.get("db_configured") is True
+        and len(rows) == 5
+        and all(row.get("passed") is True for row in rows)
+    )
 
 
 def main():
     ip, instance_id = get_host()
     if not ip:
-        print(f"no running host (instance={instance_id})")
+        print("STOP: no running W3 host recorded in .local/resources.json")
         return 1
     base = f"http://{ip}"
     reporter, operator = get_tokens()
-    _, health = curl_json(f"{base}/health")
+    if not reporter or not operator:
+        print("STOP: reporter/operator tokens are unavailable in local settings")
+        return 1
+    health_status, health = curl_json(f"{base}/health")
     version = health.get("version", "") if isinstance(health, dict) else ""
     db_configured = health.get("db_configured", "") if isinstance(health, dict) else ""
     print(f"health: version={version} db_configured={db_configured}")
+    if health_status != 200 or db_configured is not True:
+        print("STOP: health check did not confirm a configured database")
+        return 1
 
     event_id = f"test-{uuid.uuid4().hex[:16]}"
     event = {"event_id": event_id, "device_id": "dev-001",
              "observed_at": "2026-10-06T10:00:00Z", "type": "status", "note": "hello"}
     headers = {"Authorization": f"Bearer {reporter}"}
+    rows = []
+
+    def record(number, name, expected, status, body, check=None):
+        safe_body = redact(body, (reporter, operator))
+        passed = status == expected and (check is None or check(body))
+        rows.append({"number": number, "expected": expected,
+                     "status": status, "passed": passed})
+        print(f"#{number} {name} -> {status} {json.dumps(safe_body, ensure_ascii=False, sort_keys=True)}")
+        return passed
+
     code, body = curl_json(f"{base}/events", "POST", headers, event)
-    print(f"#1 POST new -> {code} {body}")
+    record(1, "POST new", 201, code, body,
+           lambda result: isinstance(result, dict)
+           and result.get("event_id") == event_id and bool(result.get("received_at")))
     code, body = curl_json(f"{base}/events", "POST", headers, event)
-    print(f"#2 POST same -> {code} {body}")
+    record(2, "POST same", 200, code, body,
+           lambda result: isinstance(result, dict) and result.get("event_id") == event_id)
     changed = {**event, "note": "changed"}
     code, body = curl_json(f"{base}/events", "POST", headers, changed)
-    print(f"#3 POST conflict -> {code} {body}")
+    record(3, "POST changed content", 409, code, body)
 
-    key_files = sorted(Path.home().glob(".ssh/w03-*-key"))
-    key = str(key_files[0]) if key_files else None
+    config_values = {}
+    config_path = ROOT / ".local" / "config"
+    if config_path.is_file():
+        for line in config_path.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                key_name, value = line.split("=", 1)
+                config_values[key_name.strip()] = value.strip()
+    owner = config_values.get("OWNER", "")
+    key_path = Path.home() / ".ssh" / f"w03-{owner}-key" if owner else None
+    key = str(key_path) if key_path and key_path.is_file() and not key_path.is_symlink() else None
     if key:
         restart = subprocess.run(
             ["ssh", "-i", key, "-o", "StrictHostKeyChecking=accept-new",
              "-o", "ConnectTimeout=10", f"ec2-user@{ip}",
              "sudo systemctl restart inspection"],
             capture_output=True, text=True, timeout=30)
-        if restart.returncode:
-            print(f"restart failed: exit={restart.returncode}")
+    else:
+        restart = None
+    if restart is not None and restart.returncode == 0:
         time.sleep(2)
-    code, body = curl_json(f"{base}/events/{event_id}",
-                           headers={"Authorization": f"Bearer {operator}"})
-    print(f"#4 GET after restart -> {code} {body}")
+        code, body = curl_json(f"{base}/events/{event_id}",
+                               headers={"Authorization": f"Bearer {operator}"})
+    else:
+        code, body = 0, {}
+    record(4, "GET after service restart", 200, code, body,
+           lambda result: isinstance(result, dict) and result.get("event_id") == event_id)
 
     count = "?"
-    if key:
+    if key and restart is not None and restart.returncode == 0:
         remote_script = f"""#!/bin/bash
 set -a
 . /etc/inspection/app.env
@@ -116,13 +176,14 @@ SQL
             ["ssh", "-i", key, "-o", "StrictHostKeyChecking=accept-new",
              "-o", "ConnectTimeout=15", f"ec2-user@{ip}", "sudo bash -s"],
             input=remote_script, capture_output=True, text=True, timeout=60)
-        output = result.stdout.strip() or result.stderr.strip()
-        if output:
-            lines = [line.strip() for line in output.splitlines() if line.strip()]
+        if result.returncode == 0:
+            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
             numeric = [line for line in lines if line.isdigit()]
-            count = numeric[-1] if numeric else lines[-1]
-    print(f"#5 psql count(event_id={event_id}) -> {count}")
-    return 0
+            count = numeric[-1] if numeric else "unavailable"
+        record(5, f"psql count(event_id={event_id})", 0,
+            0 if count.isdigit() else 1, {"count": count},
+            lambda result: result.get("count") == "1")
+    return 0 if matrix_passed(health_status, health, rows) else 1
 
 
 if __name__ == "__main__":

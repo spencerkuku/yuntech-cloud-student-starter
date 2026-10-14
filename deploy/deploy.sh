@@ -140,21 +140,18 @@ from pathlib import Path
 root, resources_path = map(Path, sys.argv[1:])
 sys.path.insert(0, str(root))
 from scripts.lab import context, run_aws
+from scripts.resources import load_deployment_target, ResourceLedgerError
 
 ctx = context()
 identity = run_aws(["sts", "get-caller-identity"], ctx["region"])
 if identity.get("Account") != ctx["account"] or ":assumed-role/" not in identity.get("Arn", ""):
     raise SystemExit("STOP: learnerlab identity does not match its saved context.")
 try:
-    resources = json.loads(resources_path.read_text(encoding="utf-8"))
-except (OSError, json.JSONDecodeError):
-    raise SystemExit("STOP: cannot read .local/resources.json.")
-instance_id = resources.get("instance_id")
-key_name = resources.get("key_name")
-if not isinstance(instance_id, str) or not re.fullmatch(r"i-[0-9a-f]+", instance_id):
-    raise SystemExit("STOP: resource ledger has no valid instance_id.")
-if not isinstance(key_name, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", key_name):
-    raise SystemExit("STOP: resource ledger has no valid key_name.")
+  target = load_deployment_target(resources_path)
+except ResourceLedgerError as exc:
+  raise SystemExit(f"STOP: {exc}.") from None
+instance_id = target["instance_id"]
+key_name = target["key_name"]
 response = run_aws([
     "ec2", "describe-instances", "--instance-ids", instance_id,
     "--query", "Reservations[0].Instances[0].{State:State.Name,PublicIp:PublicIpAddress,KeyName:KeyName,Tags:Tags}"
@@ -217,25 +214,22 @@ if [[ "$approval" != 'DEPLOY W5' ]]; then
   exit 1
 fi
 
-PUBLIC_IP="$(python3 - "$ROOT_DIR" "$RESOURCES_PATH" <<'PY'
+PUBLIC_IP="$(python3 - "$ROOT_DIR" "$INSTANCE_ID" "$KEY_NAME" <<'PY'
 import json
 import re
 import sys
 import time
-from pathlib import Path
 
-root, resources_path = map(Path, sys.argv[1:])
-sys.path.insert(0, str(root))
+root, instance_id, key_name = sys.argv[1:]
+sys.path.insert(0, root)
 from scripts.lab import context, run_aws
 
 ctx = context()
-resources = json.loads(resources_path.read_text(encoding="utf-8"))
-instance_id = resources["instance_id"]
 response = run_aws([
     "ec2", "describe-instances", "--instance-ids", instance_id,
     "--query", "Reservations[0].Instances[0].{State:State.Name,KeyName:KeyName}"
 ], ctx["region"])
-if response.get("KeyName") != resources.get("key_name"):
+if response.get("KeyName") != key_name:
     raise SystemExit("STOP: tracked instance key pair changed.")
 state = response.get("State")
 if state == "stopped":
@@ -253,7 +247,7 @@ while True:
   if refreshed.get("State") != "pending" or time.monotonic() >= deadline:
     raise SystemExit("STOP: instance did not reach running state within five minutes.")
   time.sleep(5)
-if refreshed.get("State") != "running" or refreshed.get("KeyName") != resources.get("key_name"):
+if refreshed.get("State") != "running" or refreshed.get("KeyName") != key_name:
     raise SystemExit("STOP: instance did not reach the expected running state.")
 public_ip = refreshed.get("PublicIp")
 if not isinstance(public_ip, str) or not re.fullmatch(r"[0-9.]+", public_ip):
