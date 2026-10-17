@@ -52,6 +52,8 @@ input{padding:.3rem;min-width:22rem}
 <form id="load">
 <label for="token">operator 權杖</label>
 <input id="token" type="password" autocomplete="off" spellcheck="false" required>
+<label for="device-id">設備編號</label>
+<input id="device-id" type="text" autocomplete="off" spellcheck="false">
 <button type="submit">讀取</button>
 </form>
 <p id="status"></p>
@@ -62,6 +64,7 @@ input{padding:.3rem;min-width:22rem}
 <script>
 const form = document.getElementById("load");
 const tokenInput = document.getElementById("token");
+const deviceInput = document.getElementById("device-id");
 const statusLine = document.getElementById("status");
 const tableBody = document.getElementById("events");
 let operatorToken = "";
@@ -74,7 +77,9 @@ form.addEventListener("submit", async function (event) {
   tableBody.replaceChildren();
   let response, data;
   try {
-    response = await fetch("/events", { headers: { Authorization: "Bearer " + operatorToken } });
+    const deviceId = deviceInput.value.trim();
+    const query = deviceId ? "?" + new URLSearchParams({ device_id: deviceId }) : "";
+    response = await fetch("/events" + query, { headers: { Authorization: "Bearer " + operatorToken } });
     data = await response.json();
   } catch (err) {
     operatorToken = "";
@@ -261,14 +266,20 @@ class EventStore:
         with self._lock:
             return self._mem.get(event_id)
 
-    def latest(self, limit=MAX_LIST):
+    def latest(self, limit=MAX_LIST, device_id=None):
         if self._db_ok and self._conn:
             try:
                 cur = self._conn.cursor()
-                cur.execute(
-                    "SELECT event_id, device_id, observed_at, type, note, received_at FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s",
-                    (limit,),
-                )
+                if device_id is None:
+                    cur.execute(
+                        "SELECT event_id, device_id, observed_at, type, note, received_at FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                        (limit,),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT event_id, device_id, observed_at, type, note, received_at FROM events WHERE device_id=%s ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                        (device_id, limit),
+                    )
                 rows = cur.fetchall()
                 cur.close()
                 out = []
@@ -288,6 +299,10 @@ class EventStore:
                 return None
         with self._lock:
             items = list(self._mem.values())
+        if device_id is not None:
+            items = [item for item in items if item["device_id"] == device_id]
+            items.sort(key=lambda item: (item["received_at"], item["event_id"]), reverse=True)
+            return items[:limit]
         return list(reversed(items[-limit:]))
 
 
@@ -441,7 +456,21 @@ def make_server(version_file, port=8080):
             if route == "/events":
                 if not self.authenticate("operator"):
                     return
-                events = store.latest()
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlsplit(self.path).query,
+                    keep_blank_values=True,
+                )
+                device_ids = query.get("device_id", [])
+                if len(device_ids) > 1:
+                    return self._error(400, "invalid_device_id", "device_id")
+                device_id = device_ids[0] if device_ids else None
+                if device_id == "":
+                    device_id = None
+                elif device_id is not None and (
+                    len(device_id) > 32 or not EVENT_ID_PATTERN.fullmatch(device_id)
+                ):
+                    return self._error(400, "invalid_device_id", "device_id")
+                events = store.latest(device_id=device_id)
                 if events is None:
                     return self._error(503, "database_unavailable", "database")
                 return self._send(200, {"events": events})

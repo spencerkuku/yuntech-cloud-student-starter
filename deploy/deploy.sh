@@ -7,6 +7,8 @@ LOCAL_DIR="${ROOT_DIR}/.local"
 RESOURCES_PATH="${LOCAL_DIR}/resources.json"
 APP_ENV_PATH="${LOCAL_DIR}/app.env"
 DB_ENV_PATH="${LOCAL_DIR}/db.env"
+IOT_DIR="${LOCAL_DIR}/iot"
+DEPLOY_APP_ENV_PATH=""
 USER_DATA_PATH="${LOCAL_DIR}/w04-user-data.sh"
 COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 
@@ -55,12 +57,55 @@ for line in env_path.read_text(encoding="utf-8").splitlines():
   if not value or (key.endswith("_TOKEN") and re.search(r"\s", value)):
     raise SystemExit("STOP: .local/app.env contains an empty or invalid setting.")
   values[key] = value
-tokens = {"REPORTER_TOKEN", "OPERATOR_TOKEN"}
-iot_settings = {"IOT_ENDPOINT", "IOT_TOPIC", "IOT_CLIENT_ID", "IOT_DEVICE_IDS",
-                "IOT_CA", "IOT_CERT", "IOT_KEY"}
-if not tokens <= values.keys() or (values.keys() & iot_settings and
-                                   not iot_settings <= values.keys()):
-  raise SystemExit("STOP: .local/app.env must contain the two W4 token settings.")
+if not {"REPORTER_TOKEN", "OPERATOR_TOKEN"} <= values.keys():
+  raise SystemExit("STOP: .local/app.env must contain the W5 reporter and operator token settings.")
+PY
+
+python3 - "$IOT_DIR" <<'PY'
+import stat
+import sys
+from pathlib import Path
+
+iot_dir = Path(sys.argv[1])
+if iot_dir.is_symlink() or not iot_dir.is_dir() or stat.S_IMODE(iot_dir.stat().st_mode) != 0o700:
+    raise SystemExit("STOP: .local/iot must be a non-symlink directory with mode 700.")
+for name in ("endpoint", "consumer.cert.pem", "consumer.private.key", "AmazonRootCA1.pem"):
+    path = iot_dir / name
+    if path.is_symlink() or not path.is_file() or stat.S_IMODE(path.stat().st_mode) != 0o600:
+        raise SystemExit("STOP: required .local/iot files must be regular non-symlink files with mode 600.")
+PY
+
+DEPLOY_APP_ENV_PATH="$(mktemp "${TMPDIR:-/tmp}/w06-app-env.XXXXXX")"
+chmod 600 "$DEPLOY_APP_ENV_PATH"
+trap 'rm -f "$DEPLOY_APP_ENV_PATH"' EXIT
+python3 - "$APP_ENV_PATH" "$IOT_DIR/endpoint" "$DEPLOY_APP_ENV_PATH" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+source, endpoint_path, destination = map(Path, sys.argv[1:])
+lines = source.read_text(encoding="utf-8").splitlines()
+base_lines = [
+    line for line in lines
+    if not line.partition("=")[0].strip().startswith("IOT_")
+]
+endpoint = endpoint_path.read_text(encoding="ascii").strip()
+if not re.fullmatch(r"[A-Za-z0-9.-]+\.iot\.us-east-1\.amazonaws\.com", endpoint):
+    raise SystemExit("STOP: .local/iot/endpoint is not a valid us-east-1 IoT endpoint.")
+devices = ",".join(f"g02-lin-d{i:02d}" for i in range(1, 11))
+values = {
+    "IOT_ENDPOINT": endpoint,
+    "IOT_TOPIC": "cxe/g02-lin/gw/events",
+    "IOT_CLIENT_ID": "consumer-g02-lin",
+    "IOT_DEVICE_IDS": devices,
+    "IOT_CA": "/etc/inspection/iot/AmazonRootCA1.pem",
+    "IOT_CERT": "/etc/inspection/iot/consumer.cert.pem",
+    "IOT_KEY": "/etc/inspection/iot/consumer.private.key",
+}
+with destination.open("w", encoding="utf-8") as stream:
+    stream.write("\n".join(base_lines).rstrip() + "\n")
+    for key, value in values.items():
+        stream.write(f"{key}={value}\n")
 PY
 
 if [[ ! -f "$DB_ENV_PATH" || -L "$DB_ENV_PATH" ]]; then
@@ -95,7 +140,7 @@ if [[ ! -f "$RESOURCES_PATH" || -L "$RESOURCES_PATH" ]]; then
 fi
 
 # The package builder reads committed app/service.py and deploy/nginx.conf only.
-for source in app/service.py deploy/nginx.conf deploy/make_user_data.py deploy/make-user-data.sh deploy/deploy.sh; do
+for source in app/service.py app/consumer.py deploy/nginx.conf deploy/make_user_data.py deploy/make-user-data.sh deploy/deploy.sh; do
   if ! git -C "$ROOT_DIR" ls-files --error-unmatch "$source" >/dev/null 2>&1; then
     echo "STOP: deployment source is not tracked: ${source}" >&2
     exit 1
@@ -262,16 +307,20 @@ printf 'Refreshed SSH target: ec2-user@%s\n' "$PUBLIC_IP"
 SSH_OPTIONS=(-i "$KEY_PATH" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10)
 ssh "${SSH_OPTIONS[@]}" "ec2-user@${PUBLIC_IP}" 'sudo bash -s' < "$USER_DATA_PATH"
 
-REMOTE_INSTALL_COMMAND='sudo install -d -o root -g root -m 755 /etc/inspection && sudo chmod 755 /etc/inspection && sudo install -d -o inspection -g inspection -m 700 /etc/inspection/iot && sudo tee /etc/inspection/app.env >/dev/null && sudo chown root:root /etc/inspection/app.env && sudo chmod 600 /etc/inspection/app.env && sudo install -d -o root -g root -m 755 /etc/systemd/system/inspection.service.d && printf "%s\n" "[Service]" "EnvironmentFile=/etc/inspection/app.env" | sudo tee /etc/systemd/system/inspection.service.d/app-env.conf >/dev/null && sudo chown root:root /etc/systemd/system/inspection.service.d/app-env.conf && sudo chmod 644 /etc/systemd/system/inspection.service.d/app-env.conf && test "$(sudo stat -c %U:%G:%a /etc/inspection)" = "root:root:755" && test "$(sudo stat -c %U:%G:%a /etc/inspection/iot)" = "inspection:inspection:700" && test "$(sudo stat -c %U:%G:%a /etc/inspection/app.env)" = "root:root:600"'
-ssh "${SSH_OPTIONS[@]}" "ec2-user@${PUBLIC_IP}" "$REMOTE_INSTALL_COMMAND" < "$APP_ENV_PATH"
+REMOTE_INSTALL_COMMAND='sudo install -d -o root -g root -m 755 /etc/inspection && sudo chmod 755 /etc/inspection && sudo install -d -o inspection -g inspection -m 700 /etc/inspection/iot && sudo sh -c '"'"'umask 077; cat > /etc/inspection/app.env && chown root:root /etc/inspection/app.env && chmod 600 /etc/inspection/app.env'"'"' && sudo install -d -o root -g root -m 755 /etc/systemd/system/inspection.service.d && printf "%s\n" "[Service]" "EnvironmentFile=/etc/inspection/app.env" | sudo tee /etc/systemd/system/inspection.service.d/app-env.conf >/dev/null && sudo chown root:root /etc/systemd/system/inspection.service.d/app-env.conf && sudo chmod 644 /etc/systemd/system/inspection.service.d/app-env.conf && test "$(sudo stat -c %U:%G:%a /etc/inspection)" = "root:root:755" && test "$(sudo stat -c %U:%G:%a /etc/inspection/iot)" = "inspection:inspection:700" && test "$(sudo stat -c %U:%G:%a /etc/inspection/app.env)" = "root:root:600"'
+ssh "${SSH_OPTIONS[@]}" "ec2-user@${PUBLIC_IP}" "$REMOTE_INSTALL_COMMAND" < "$DEPLOY_APP_ENV_PATH"
 printf 'Remote app.env owner and mode verified: root:root 600\n'
 REMOTE_DB_COMMAND="sudo sh -c 'umask 077; cat >> /etc/inspection/app.env; chown root:root /etc/inspection/app.env; chmod 600 /etc/inspection/app.env'"
 ssh "${SSH_OPTIONS[@]}" "ec2-user@${PUBLIC_IP}" "$REMOTE_DB_COMMAND" < "$DB_ENV_PATH"
 printf 'Remote DB settings installed without printing values.\n'
-ssh "${SSH_OPTIONS[@]}" "ec2-user@${PUBLIC_IP}" 'sudo systemctl daemon-reload && sudo systemctl restart inspection && systemctl is-active --quiet inspection'
+
+tar -C "$IOT_DIR" -cf - consumer.cert.pem consumer.private.key AmazonRootCA1.pem |
+  ssh "${SSH_OPTIONS[@]}" "ec2-user@${PUBLIC_IP}" "sudo sh -c 'umask 077; tar -xf - -C /etc/inspection/iot && chown inspection:inspection /etc/inspection/iot/consumer.cert.pem /etc/inspection/iot/consumer.private.key /etc/inspection/iot/AmazonRootCA1.pem && chmod 600 /etc/inspection/iot/consumer.cert.pem /etc/inspection/iot/consumer.private.key /etc/inspection/iot/AmazonRootCA1.pem && test \"\$(stat -c %U:%G:%a /etc/inspection)\" = root:root:755 && test \"\$(stat -c %U:%G:%a /etc/inspection/iot)\" = inspection:inspection:700 && test \"\$(stat -c %U:%G:%a /etc/inspection/iot/consumer.cert.pem)\" = inspection:inspection:600 && test \"\$(stat -c %U:%G:%a /etc/inspection/iot/consumer.private.key)\" = inspection:inspection:600 && test \"\$(stat -c %U:%G:%a /etc/inspection/iot/AmazonRootCA1.pem)\" = inspection:inspection:600'"
+printf 'Consumer certificate, key and CA installed with verified owner and mode.\n'
+ssh "${SSH_OPTIONS[@]}" "ec2-user@${PUBLIC_IP}" 'sudo systemctl daemon-reload && sudo systemctl restart inspection && sudo systemctl enable inspection-consumer && sudo systemctl restart inspection-consumer && systemctl is-active inspection inspection-consumer'
 
 HEALTH_PATH="$(mktemp "${TMPDIR:-/tmp}/w04-health.XXXXXX")"
-trap 'rm -f "$HEALTH_PATH"' EXIT
+trap 'rm -f "$HEALTH_PATH" "$DEPLOY_APP_ENV_PATH"' EXIT
 curl --fail --silent --show-error --max-time 8 "http://${PUBLIC_IP}/health" -o "$HEALTH_PATH"
 python3 - "$COMMIT" "$HEALTH_PATH" <<'PY'
 import json
@@ -290,4 +339,4 @@ if health.get("db_configured") is not True:
   raise SystemExit("STOP: health endpoint reports db_configured=false.")
 print("Health verified: version, auth and database configuration match.")
 PY
-printf 'W5 deployment complete for instance %s at %s.\n' "$INSTANCE_ID" "$PUBLIC_IP"
+printf 'W6 deployment complete for instance %s at %s.\n' "$INSTANCE_ID" "$PUBLIC_IP"
