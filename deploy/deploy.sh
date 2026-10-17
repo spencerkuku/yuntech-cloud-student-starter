@@ -121,7 +121,9 @@ secrets = []
 for env_path in (app_env_path, db_env_path):
   for line in env_path.read_text(encoding="utf-8").splitlines():
     key, separator, value = line.partition("=")
-    if separator and value:
+    if separator and value and key in {
+        "REPORTER_TOKEN", "OPERATOR_TOKEN", "DB_PASSWORD", "DB_HOST"
+    }:
       secrets.append(value.encode("utf-8"))
 payload = user_data_path.read_bytes()
 if any(secret in payload for secret in secrets):
