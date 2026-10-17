@@ -79,6 +79,16 @@ def describe_one(service, args, region, key):
     rows = result.get(key, [])
     return rows[0] if rows else None
 
+
+def find_existing_rds(region, identifier):
+    result = run_aws(['rds', 'describe-db-instances'], region)
+    return next(
+        (db for db in result['DBInstances']
+         if db['DBInstanceIdentifier'] == identifier),
+        None
+    )
+
+
 def should_create_rds(w5_resources, aws_instance=None):
     if 'db_instance' in w5_resources:
         return False
@@ -168,6 +178,11 @@ def main():
             existing[f'private_subnet_{index}'] = {'id': sid, 'cidr': cidr, 'az': az}; save_json(RES, d); tag(region, sid, owner)
         print(f'created private subnets and route table {rt["RouteTableId"]}')
     else:
+        if not all(key in existing for key in ('private_subnet_1', 'private_subnet_2')):
+            raise SystemExit(
+                'STOP: partial W5 subnet deployment recorded; '
+                'inspect AWS resources before retrying'
+            )
         cidrs = [(existing['private_subnet_1']['cidr'], existing['private_subnet_1']['az']),
                  (existing['private_subnet_2']['cidr'], existing['private_subnet_2']['az'])]
 
@@ -194,9 +209,7 @@ def main():
         raise SystemExit(f'STOP: {exc}') from None
 
     if should_create_rds(existing):
-        already_exists = describe_one(
-            'rds', ['describe-db-instances', '--db-instance-identifier', dbid],
-            region, 'DBInstances')
+        already_exists = find_existing_rds(region, dbid)
         if not should_create_rds(existing, already_exists):
             raise SystemExit('STOP: unexpected existing RDS state; inspect resources.json before retrying')
         approve_if_needed(cidrs)

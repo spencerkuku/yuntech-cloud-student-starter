@@ -60,6 +60,31 @@ class ResourceLedgerTests(unittest.TestCase):
 
 
 
+
+class W5RdsLookupTests(unittest.TestCase):
+    def test_missing_rds_returns_none(self):
+        with mock.patch.object(
+            db_up, "run_aws",
+            return_value={"DBInstances": []}
+        ):
+            self.assertIsNone(
+                db_up.find_existing_rds("us-east-1", "w05-copilot-pg")
+            )
+
+    def test_existing_rds_is_found(self):
+        db = {"DBInstanceIdentifier": "w05-copilot-pg"}
+        with mock.patch.object(
+            db_up, "run_aws",
+            return_value={"DBInstances": [
+                {"DBInstanceIdentifier": "another-db"}, db
+            ]}
+        ):
+            self.assertEqual(
+                db_up.find_existing_rds("us-east-1", "w05-copilot-pg"),
+                db
+            )
+
+
 class W5LegacyRdsTests(unittest.TestCase):
     def test_flat_ledger_uses_verified_aws_instance(self):
         ledger = {
