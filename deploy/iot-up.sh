@@ -65,6 +65,31 @@ def atomic_write(path, content):
             os.unlink(temp_name)
 
 
+def atomic_create(path, content):
+    if path.exists() or path.is_symlink():
+        stop(f"Recovery state already exists at {path.relative_to(ROOT)}; inspect it before retrying")
+    fd, temp_name = tempfile.mkstemp(prefix=".iot-state-", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temp_name, path)
+        except FileExistsError:
+            stop(f"Recovery state already exists at {path.relative_to(ROOT)}; inspect it before retrying")
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        os.chmod(path, 0o600)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
 def write_once(path, content):
     if path.is_symlink():
         stop(f"Refusing symlinked credential file: {path.relative_to(ROOT)}")
@@ -131,11 +156,31 @@ def parse_create_response(path):
     return cert_id, cert_pem, private_key
 
 
-def create_response_file(path):
+def load_create_state(path):
+    if path.is_symlink():
+        stop(f"Refusing symlinked certificate recovery state: {path.relative_to(ROOT)}")
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        stop(f"Certificate creation state is incomplete at {path.relative_to(ROOT)}; inspect AWS and local files before retrying")
+    if not isinstance(state, dict) or state.get("state") not in {
+        "request_may_have_been_sent",
+        "certificate_material_saved",
+    }:
+        stop(f"Certificate creation state is invalid at {path.relative_to(ROOT)}; inspect before retrying")
+    return state
+
+
+def save_create_state(path, state):
+    atomic_write(path, (json.dumps(state, separators=(",", ":")) + "\n").encode("utf-8"))
+
+
+def create_response_file(path, state_path):
+    atomic_create(
+        state_path,
+        b'{"state":"request_may_have_been_sent"}\n',
+    )
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.fchmod(fd, 0o600)
     command = [
         "aws", "--profile", "learnerlab", "--region", REGION, "--no-cli-pager",
@@ -154,22 +199,21 @@ def create_response_file(path):
             output.flush()
             os.fsync(output.fileno())
     except subprocess.TimeoutExpired:
-        stop(f"Certificate creation timed out; protected response retained at {path.relative_to(ROOT)}. Inspect before retrying.")
+        stop(f"Certificate creation timed out; recovery state retained at {state_path.relative_to(ROOT)}. Inspect before retrying.")
     except FileNotFoundError:
         stop("AWS CLI is missing; open the course devcontainer")
     except OSError as exc:
         stop(f"Could not securely save certificate response ({type(exc).__name__})")
     if result.returncode:
-        if path.stat().st_size == 0:
-            path.unlink()
         code = error_code(result.stderr.decode("utf-8", errors="replace"))
-        stop(f"iot create-keys-and-certificate failed ({code}); no response was printed")
+        stop(f"iot create-keys-and-certificate failed ({code}); recovery state retained for manual inspection")
 
 
 def ensure_certificate(kind):
     ledger_key = "iot_gw_cert_id" if kind == "gateway" else "iot_consumer_cert_id"
     basename = "gw" if kind == "gateway" else "consumer"
     response_file = IOT_DIR / f".{basename}.create.json"
+    state_file = IOT_DIR / f".{basename}.create.state.json"
     cert_file = IOT_DIR / f"{basename}.cert.pem"
     key_file = IOT_DIR / f"{basename}.private.key"
     resources = load_ledger()
@@ -178,26 +222,65 @@ def ensure_certificate(kind):
         cert_id = resources[ledger_key]
         if not isinstance(cert_id, str) or not re.fullmatch(r"[A-Fa-f0-9]{64}", cert_id):
             stop(f"Invalid certificate ID in .local/resources.json ({ledger_key})")
-        if not cert_file.is_file() or not key_file.is_file():
+        if (
+            cert_file.is_symlink()
+            or key_file.is_symlink()
+            or not cert_file.is_file()
+            or not key_file.is_file()
+        ):
             stop(f"Ledger contains {ledger_key}, but its local certificate files are missing; refusing to recreate it")
         os.chmod(cert_file, 0o600)
         os.chmod(key_file, 0o600)
+        state = None
+        if state_file.exists():
+            state = load_create_state(state_file)
+            if state.get("state") != "certificate_material_saved" or state.get("certificateId") != cert_id:
+                stop(f"Certificate recovery state conflicts with .local/resources.json ({ledger_key}); inspect before retrying")
         if response_file.exists():
-            recovered_id, _, _ = parse_create_response(response_file)
-            if recovered_id != cert_id:
+            if state is None:
+                stop(f"Certificate response exists without matching recovery state at {response_file.relative_to(ROOT)}")
+            recovered_id, recovered_cert, recovered_key = parse_create_response(response_file)
+            if (
+                recovered_id != cert_id
+                or cert_file.read_bytes() != recovered_cert
+                or key_file.read_bytes() != recovered_key
+            ):
                 stop(f"Protected response conflicts with .local/resources.json ({ledger_key})")
             response_file.unlink()
+        elif state is not None:
+            if (
+                not cert_file.read_bytes().startswith(b"-----BEGIN CERTIFICATE-----")
+                or not key_file.read_bytes().startswith(b"-----BEGIN")
+            ):
+                stop(f"Saved certificate material is incomplete for {ledger_key}; inspect before retrying")
+        if state is not None:
+            state_file.unlink()
         return cert_id
 
-    if response_file.is_symlink():
-        stop(f"Refusing symlinked certificate response: {response_file.relative_to(ROOT)}")
-    create_response_file(response_file)
+    if response_file.is_symlink() or state_file.is_symlink():
+        stop(f"Refusing symlinked certificate recovery file for {basename}")
+    if not state_file.exists():
+        if response_file.exists():
+            stop(f"Certificate response exists without recovery state at {response_file.relative_to(ROOT)}; inspect before retrying")
+        create_response_file(response_file, state_file)
+    else:
+        state = load_create_state(state_file)
+        if not response_file.exists():
+            stop(f"Certificate creation may have reached AWS; recovery state retained at {state_file.relative_to(ROOT)}. Inspect before retrying")
     os.chmod(response_file, 0o600)
     cert_id, cert_pem, private_key = parse_create_response(response_file)
+    state = load_create_state(state_file)
+    if state.get("state") == "certificate_material_saved" and state.get("certificateId") != cert_id:
+        stop(f"Certificate response conflicts with recovery state at {state_file.relative_to(ROOT)}")
     write_once(cert_file, cert_pem)
     write_once(key_file, private_key)
+    save_create_state(
+        state_file,
+        {"state": "certificate_material_saved", "certificateId": cert_id},
+    )
     record_resource(ledger_key, cert_id)
     response_file.unlink()
+    state_file.unlink()
     return cert_id
 
 
