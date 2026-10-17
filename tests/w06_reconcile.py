@@ -61,6 +61,10 @@ class ReconcileError(Exception):
     """Safe-to-display validation or operational error."""
 
 
+class RetryableSSHError(ReconcileError):
+    """Temporary SSH transport failure that may succeed on a later poll."""
+
+
 def build_prefix(code, run):
     if not isinstance(code, str) or not PREFIX_PATTERN.fullmatch(code):
         raise ReconcileError("Invalid code; use 1-40 letters, digits, or hyphens.")
@@ -187,7 +191,11 @@ def read_filtered_events(public_ip, code, prefix, token):
         if not isinstance(event, dict):
             continue
         event_id = event.get("event_id")
-        if isinstance(event_id, str) and event_id.startswith(prefix + "-"):
+        if (
+            event.get("device_id") == device_id
+            and isinstance(event_id, str)
+            and event_id.startswith(prefix + "-")
+        ):
             ids.append(event_id)
     return ids
 
@@ -258,10 +266,27 @@ def ssh_query(public_ip, key_path, prefix, timeout=SSH_TIMEOUT):
             check=False,
         )
     except subprocess.TimeoutExpired:
-        raise ReconcileError("SSH reconciliation query timed out.") from None
+        raise RetryableSSHError("SSH reconciliation query timed out.") from None
     except OSError:
         raise ReconcileError("SSH reconciliation query could not be started.") from None
     if result.returncode:
+        stderr = result.stderr or b""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        if not isinstance(stderr, str):
+            stderr = ""
+        if result.returncode == 255 and any(
+            message in stderr.lower()
+            for message in (
+                "connection timed out",
+                "connection refused",
+                "connection reset",
+                "no route to host",
+                "network is unreachable",
+                "temporary failure in name resolution",
+            )
+        ):
+            raise RetryableSSHError("SSH connection failed temporarily.")
         raise ReconcileError("SSH reconciliation query failed; check consumer and database service status.")
     try:
         output = result.stdout.decode("utf-8")
@@ -274,26 +299,64 @@ def collect_remote_counts(public_ip, key_path, prefix, clock=time.monotonic, sle
     deadline = clock() + POLL_TIMEOUT
     counts = {name: 0 for name in RESULT_NAMES}
     db_count = 0
+    retry_pending = False
     while True:
         remaining = deadline - clock()
         if remaining <= 0:
+            if retry_pending:
+                raise ReconcileError(
+                    "SSH reconciliation could not connect before the retry deadline."
+                )
             return counts, db_count
-        counts, db_count = ssh_query(
-            public_ip,
-            key_path,
-            prefix,
-            timeout=min(SSH_TIMEOUT, remaining),
-        )
+        try:
+            counts, db_count = ssh_query(
+                public_ip,
+                key_path,
+                prefix,
+                timeout=min(SSH_TIMEOUT, remaining),
+            )
+        except RetryableSSHError:
+            retry_pending = True
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise ReconcileError(
+                    "SSH reconciliation could not connect before the retry deadline."
+                ) from None
+            sleep(min(POLL_INTERVAL, remaining))
+            continue
+        retry_pending = False
         if sum(counts.values()) >= 32 or clock() >= deadline:
             return counts, db_count
         sleep(min(POLL_INTERVAL, max(0, deadline - clock())))
 
 
 def print_report(health, prefix, puback_count, counts, db_count, d01_event_ids):
+    consumer_total = sum(counts[name] for name in RESULT_NAMES)
+    failures = []
+    if puback_count != 32:
+        failures.append("puback")
+    if consumer_total < 32:
+        failures.append("consumer_incomplete")
+    if any(
+        counts[name] != expected
+        for name, expected in (
+            ("created", 30),
+            ("duplicate", 1),
+            ("rejected", 1),
+            ("error", 0),
+        )
+    ):
+        failures.append("consumer_counts")
+    if db_count != 30:
+        failures.append("database_count")
+    if len(d01_event_ids) != 3:
+        failures.append("d01_count")
+
     print(f"version={health['version']}")
     print(f"db_configured={str(health['db_configured']).lower()}")
     print(f"prefix={prefix}")
     print(f"puback_ok={puback_count}/32")
+    print(f"consumer_complete={str(consumer_total >= 32).lower()}")
     print(
         "consumer created={created} duplicate={duplicate} rejected={rejected} error={error}".format(
             **counts
@@ -303,6 +366,10 @@ def print_report(health, prefix, puback_count, counts, db_count, d01_event_ids):
     for event_id in d01_event_ids:
         print(f"event_id={event_id}")
     print(f"d01_count={len(d01_event_ids)}")
+    print(f"reconcile={'PASS' if not failures else 'FAIL'}")
+    if failures:
+        print(f"reconcile_failures={','.join(failures)}")
+    return not failures
 
 
 def make_parser():
@@ -323,11 +390,11 @@ def main(argv=None):
         operator_token = load_operator_token(APP_ENV_FILE)
         counts, db_count = collect_remote_counts(public_ip, key_path, prefix)
         event_ids = read_filtered_events(public_ip, args.code, prefix, operator_token)
-        print_report(health, prefix, puback_count, counts, db_count, event_ids)
+        passed = print_report(health, prefix, puback_count, counts, db_count, event_ids)
     except ReconcileError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    return 0
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
