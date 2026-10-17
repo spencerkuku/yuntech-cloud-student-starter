@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 import ipaddress
 import json
-import os
 from pathlib import Path
-import secrets
-import string
-import subprocess
 import sys
+import tempfile
 import time
 
-sys.path.insert(0,'scripts')
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'scripts'))
 from lab import run_aws, context, LabError, verify
+from w5_db import (create_db_instance, load_or_create_password,
+                   record_available_endpoint)
 
-ROOT = os.path.abspath('.')
-RES = os.path.join(ROOT,'.local','resources.json')
-CFG = os.path.join(ROOT,'.local','config')
-DBENV = os.path.join(ROOT,'.local','db.env')
+RES = ROOT / '.local' / 'resources.json'
+CFG = ROOT / '.local' / 'config'
+DBENV = ROOT / '.local' / 'db.env'
 WEEK = 'w05'
 
 def load_json(p):
@@ -35,33 +34,79 @@ def load_config():
             raise SystemExit(f'STOP: {key} missing in {CFG}')
     return values
 
-def write_db_env(host, password):
-    path = Path(DBENV)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    content = f'DB_HOST={host}\nDB_NAME=inspection\nDB_USER=inspection\nDB_PASSWORD={password}\n'
-    temporary = path.with_suffix('.tmp')
-    temporary.write_text(content, encoding='utf-8')
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
+def current_round(resources, region):
+    if 'rounds' in resources:
+        live = [r for r in resources['rounds']
+                if r.get('instance', {}).get('state') != 'terminated']
+        if not live:
+            raise SystemExit('STOP: no live EC2 round in .local/resources.json')
+        row = live[-1]
+        if not row.get('subnet_id') or not row.get('security_group', {}).get('id'):
+            raise SystemExit('STOP: live round has no subnet or host security group')
+        return row
 
-def current_round(resources):
-    live = [r for r in resources.get('rounds', [])
-            if r.get('instance', {}).get('state') != 'terminated']
-    if not live:
-        raise SystemExit('STOP: no live EC2 round in .local/resources.json')
-    row = live[-1]
-    if not row.get('subnet_id') or not row.get('security_group', {}).get('id'):
-        raise SystemExit('STOP: live round has no subnet or host security group')
-    return row
+    from resources import deployment_target, ResourceLedgerError
+    try:
+        target = deployment_target(resources)
+    except ResourceLedgerError as exc:
+        raise SystemExit(f'STOP: {exc}') from None
+
+    instance = describe_one(
+        'ec2', ['describe-instances', '--instance-ids', target['instance_id']],
+        region, 'Reservations'
+    )
+    if not instance or len(instance.get('Instances', [])) != 1:
+        raise SystemExit('STOP: legacy EC2 instance not found in AWS')
+
+    ec2 = instance['Instances'][0]
+    groups = [sg['GroupId'] for sg in ec2.get('SecurityGroups', [])]
+    sg_id = resources.get('sg_id')
+
+    if (ec2.get('State', {}).get('Name') != target['state']
+            or ec2.get('KeyName') != target['key_name']
+            or not ec2.get('SubnetId')
+            or not sg_id
+            or sg_id not in groups):
+        raise SystemExit('STOP: legacy EC2 details do not match AWS')
+
+    return {
+        'subnet_id': ec2['SubnetId'],
+        'security_group': {'id': sg_id},
+    }
 
 def describe_one(service, args, region, key):
     result = run_aws([service, *args], region)
     rows = result.get(key, [])
     return rows[0] if rows else None
 
+
+def find_existing_rds(region, identifier):
+    result = run_aws(['rds', 'describe-db-instances'], region)
+    return next(
+        (db for db in result['DBInstances']
+         if db['DBInstanceIdentifier'] == identifier),
+        None
+    )
+
+
+def should_create_rds(w5_resources, aws_instance=None):
+    if 'db_instance' in w5_resources:
+        return False
+    if aws_instance:
+        raise SystemExit('STOP: RDS identifier exists but is not recorded in .local/resources.json; inspect ownership before retrying')
+    return True
+
+def recorded_rds_identifier(w5_resources, expected_identifier):
+    db_instance = w5_resources.get('db_instance')
+    if db_instance is None:
+        return expected_identifier
+    if not isinstance(db_instance, dict) or db_instance.get('identifier') != expected_identifier:
+        raise SystemExit('STOP: recorded RDS identifier does not match OWNER; inspect .local/resources.json')
+    return expected_identifier
+
 def choose_private_subnets(region, vpc_id, used_cidrs, azs):
     existing = run_aws(['ec2', 'describe-subnets', '--filters', f'Name=vpc-id,Values={vpc_id}'], region)['Subnets']
-    networks = [ipaddress.ip_network(item['CidrBlock']) for item in used_cidrs]
+    networks = [ipaddress.ip_network(item) for item in used_cidrs]
     candidates = []
     vpc = describe_one('ec2', ['describe-vpcs', '--vpc-ids', vpc_id], region, 'Vpcs')
     vpc_net = ipaddress.ip_network(vpc['CidrBlock'])
@@ -101,7 +146,7 @@ def main():
     verify(ctx)
     d=load_json(RES)
     owner = load_config()['OWNER']
-    round_data = current_round(d)
+    round_data = current_round(d, region)
     host_subnet = describe_one('ec2', ['describe-subnets', '--subnet-ids', round_data['subnet_id']], region, 'Subnets')
     vpc_id = host_subnet['VpcId']
     host_sg = round_data['security_group']['id']
@@ -109,11 +154,20 @@ def main():
     d['w5'] = d.get('w5', {})
 
     existing = d['w5']
+    dbid = recorded_rds_identifier(existing, dbid)
+    approved = False
+
+    def approve_if_needed(cidrs):
+        nonlocal approved
+        if not approved:
+            approve(owner, vpc_id, host_sg, cidrs, dbid)
+            approved = True
+
     if 'route_table' not in existing:
         used = [s['CidrBlock'] for s in run_aws(['ec2', 'describe-subnets', '--filters', f'Name=vpc-id,Values={vpc_id}'], region)['Subnets']]
         azs = [s['AvailabilityZone'] for s in run_aws(['ec2', 'describe-subnets', '--filters', f'Name=vpc-id,Values={vpc_id}'], region)['Subnets']]
         cidrs = choose_private_subnets(region, vpc_id, used, azs)
-        approve(owner, vpc_id, host_sg, cidrs, dbid)
+        approve_if_needed(cidrs)
         rt = run_aws(['ec2', 'create-route-table', '--vpc-id', vpc_id], region)['RouteTable']
         existing['route_table'] = {'id': rt['RouteTableId']}; save_json(RES, d); tag(region, rt['RouteTableId'], owner)
         for index, (cidr, az) in enumerate(cidrs, 1):
@@ -124,10 +178,16 @@ def main():
             existing[f'private_subnet_{index}'] = {'id': sid, 'cidr': cidr, 'az': az}; save_json(RES, d); tag(region, sid, owner)
         print(f'created private subnets and route table {rt["RouteTableId"]}')
     else:
+        if not all(key in existing for key in ('private_subnet_1', 'private_subnet_2')):
+            raise SystemExit(
+                'STOP: partial W5 subnet deployment recorded; '
+                'inspect AWS resources before retrying'
+            )
         cidrs = [(existing['private_subnet_1']['cidr'], existing['private_subnet_1']['az']),
                  (existing['private_subnet_2']['cidr'], existing['private_subnet_2']['az'])]
 
     if 'db_subnet_group' not in existing:
+        approve_if_needed(cidrs)
         name = f'w05-{owner}-dbsg'
         run_aws(['rds', 'create-db-subnet-group', '--db-subnet-group-name', name,
                  '--db-subnet-group-description', 'W5 private inspection database',
@@ -135,6 +195,7 @@ def main():
         existing['db_subnet_group'] = {'name': name, 'subnets': [existing['private_subnet_1']['id'], existing['private_subnet_2']['id']]}; save_json(RES, d)
 
     if 'security_group_db' not in existing:
+        approve_if_needed(cidrs)
         sg = run_aws(['ec2', 'create-security-group', '--group-name', f'w05-{owner}-db-sg',
                       '--description', 'W5 PostgreSQL from host SG only', '--vpc-id', vpc_id], region)['GroupId']
         run_aws(['ec2', 'authorize-security-group-ingress', '--group-id', sg, '--ip-permissions', json.dumps([{
@@ -142,27 +203,35 @@ def main():
             'UserIdGroupPairs': [{'GroupId': host_sg}]}])], region)
         existing['security_group_db'] = {'id': sg}; save_json(RES, d); tag(region, sg, owner)
 
-    db_secret = Path(DBENV)
-    password = None
-    if db_secret.exists():
-        if (db_secret.stat().st_mode & 0o777) != 0o600:
-            raise SystemExit(f'STOP: {DBENV} must be mode 600')
-    else:
-        password = secrets.token_urlsafe(32)
+    try:
+        password = load_or_create_password(existing, DBENV)
+    except ValueError as exc:
+        raise SystemExit(f'STOP: {exc}') from None
 
-    if 'db_instance' not in existing:
-        if password is None:
-            raise SystemExit(f'STOP: {DBENV} exists but is unreadable by this workflow; preserve it and inspect manually')
-        run_aws(['rds', 'create-db-instance', '--db-instance-identifier', dbid,
-                 '--db-instance-class', 'db.t3.micro', '--engine', 'postgres',
-                 '--allocated-storage', '20', '--storage-type', 'gp3', '--storage-encrypted',
-                 '--no-publicly-accessible', '--no-multi-az', '--db-name', 'inspection',
-                 '--master-username', 'inspection', '--master-user-password', password,
-                 '--db-subnet-group-name', existing['db_subnet_group']['name'],
-                 '--vpc-security-group-ids', existing['security_group_db']['id'],
-                 '--backup-retention-period', '1'], region)
+    if should_create_rds(existing):
+        already_exists = find_existing_rds(region, dbid)
+        if not should_create_rds(existing, already_exists):
+            raise SystemExit('STOP: unexpected existing RDS state; inspect resources.json before retrying')
+        approve_if_needed(cidrs)
+        parameters = {
+            'DBInstanceIdentifier': dbid,
+            'DBInstanceClass': 'db.t3.micro',
+            'Engine': 'postgres',
+            'AllocatedStorage': 20,
+            'StorageType': 'gp3',
+            'StorageEncrypted': True,
+            'PubliclyAccessible': False,
+            'MultiAZ': False,
+            'DBName': 'inspection',
+            'MasterUsername': 'inspection',
+            'MasterUserPassword': password,
+            'DBSubnetGroupName': existing['db_subnet_group']['name'],
+            'VpcSecurityGroupIds': [existing['security_group_db']['id']],
+            'BackupRetentionPeriod': 1,
+        }
+        with tempfile.TemporaryDirectory(prefix='.w5-rds-', dir=Path.home()) as request_dir:
+            create_db_instance(run_aws, region, parameters, request_dir)
         existing['db_instance'] = {'identifier': dbid, 'status': 'creating', 'publicly_accessible': False}; save_json(RES, d)
-        write_db_env('pending', password)
         print(f'created RDS {dbid}; waiting for available')
 
     deadline = time.time() + 1800
@@ -173,12 +242,10 @@ def main():
             existing['db_instance'] = {'identifier': dbid, 'address': endpoint,
                                        'status': di['DBInstanceStatus'],
                                        'publicly_accessible': di.get('PubliclyAccessible')}; save_json(RES, d)
-            if di['DBInstanceStatus'] == 'available' and di.get('PubliclyAccessible') is False and endpoint:
-                if db_secret.exists():
-                    print('OK: available, PubliclyAccessible=false; existing db.env preserved')
-                else:
-                    write_db_env(endpoint, password)
-                    print('OK: available, PubliclyAccessible=false; wrote .local/db.env mode 600')
+            if record_available_endpoint(DBENV, di['DBInstanceStatus'],
+                                         di.get('PubliclyAccessible'), endpoint,
+                                         password):
+                print('OK: available, PubliclyAccessible=false; updated .local/db.env mode 600')
                 return
         time.sleep(30)
     raise SystemExit('STOP: timed out waiting for RDS available; inspect resources.json before retrying')
