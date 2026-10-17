@@ -34,15 +34,45 @@ def load_config():
             raise SystemExit(f'STOP: {key} missing in {CFG}')
     return values
 
-def current_round(resources):
-    live = [r for r in resources.get('rounds', [])
-            if r.get('instance', {}).get('state') != 'terminated']
-    if not live:
-        raise SystemExit('STOP: no live EC2 round in .local/resources.json')
-    row = live[-1]
-    if not row.get('subnet_id') or not row.get('security_group', {}).get('id'):
-        raise SystemExit('STOP: live round has no subnet or host security group')
-    return row
+def current_round(resources, region):
+    if 'rounds' in resources:
+        live = [r for r in resources['rounds']
+                if r.get('instance', {}).get('state') != 'terminated']
+        if not live:
+            raise SystemExit('STOP: no live EC2 round in .local/resources.json')
+        row = live[-1]
+        if not row.get('subnet_id') or not row.get('security_group', {}).get('id'):
+            raise SystemExit('STOP: live round has no subnet or host security group')
+        return row
+
+    from resources import deployment_target, ResourceLedgerError
+    try:
+        target = deployment_target(resources)
+    except ResourceLedgerError as exc:
+        raise SystemExit(f'STOP: {exc}') from None
+
+    instance = describe_one(
+        'ec2', ['describe-instances', '--instance-ids', target['instance_id']],
+        region, 'Reservations'
+    )
+    if not instance or len(instance.get('Instances', [])) != 1:
+        raise SystemExit('STOP: legacy EC2 instance not found in AWS')
+
+    ec2 = instance['Instances'][0]
+    groups = [sg['GroupId'] for sg in ec2.get('SecurityGroups', [])]
+    sg_id = resources.get('sg_id')
+
+    if (ec2.get('State', {}).get('Name') != target['state']
+            or ec2.get('KeyName') != target['key_name']
+            or not ec2.get('SubnetId')
+            or not sg_id
+            or sg_id not in groups):
+        raise SystemExit('STOP: legacy EC2 details do not match AWS')
+
+    return {
+        'subnet_id': ec2['SubnetId'],
+        'security_group': {'id': sg_id},
+    }
 
 def describe_one(service, args, region, key):
     result = run_aws([service, *args], region)
@@ -106,7 +136,7 @@ def main():
     verify(ctx)
     d=load_json(RES)
     owner = load_config()['OWNER']
-    round_data = current_round(d)
+    round_data = current_round(d, region)
     host_subnet = describe_one('ec2', ['describe-subnets', '--subnet-ids', round_data['subnet_id']], region, 'Subnets')
     vpc_id = host_subnet['VpcId']
     host_sg = round_data['security_group']['id']

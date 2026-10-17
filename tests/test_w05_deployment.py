@@ -59,6 +59,49 @@ class ResourceLedgerTests(unittest.TestCase):
                 deployment_target(resources)
 
 
+
+class W5LegacyRdsTests(unittest.TestCase):
+    def test_flat_ledger_uses_verified_aws_instance(self):
+        ledger = {
+            "instance_id": "i-0123",
+            "key_name": "old-key",
+            "sg_id": "sg-0123",
+            "state": "running",
+        }
+        aws_result = {
+            "Instances": [{
+                "State": {"Name": "running"},
+                "KeyName": "old-key",
+                "SubnetId": "subnet-0123",
+                "SecurityGroups": [{"GroupId": "sg-0123"}],
+            }]
+        }
+        with mock.patch.object(db_up, "describe_one", return_value=aws_result):
+            row = db_up.current_round(ledger, "us-east-1")
+
+        self.assertEqual(row["subnet_id"], "subnet-0123")
+        self.assertEqual(row["security_group"]["id"], "sg-0123")
+
+    def test_flat_ledger_rejects_security_group_mismatch(self):
+        ledger = {
+            "instance_id": "i-0123",
+            "key_name": "old-key",
+            "sg_id": "sg-wrong",
+            "state": "running",
+        }
+        aws_result = {
+            "Instances": [{
+                "State": {"Name": "running"},
+                "KeyName": "old-key",
+                "SubnetId": "subnet-0123",
+                "SecurityGroups": [{"GroupId": "sg-real"}],
+            }]
+        }
+        with mock.patch.object(db_up, "describe_one", return_value=aws_result):
+            with self.assertRaises(SystemExit):
+                db_up.current_round(ledger, "us-east-1")
+
+
 class W5DatabaseBootstrapTests(unittest.TestCase):
     def test_endpoint_replaces_pending_and_preserves_private_settings(self):
         with tempfile.TemporaryDirectory() as directory:
