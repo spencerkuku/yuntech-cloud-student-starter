@@ -18,10 +18,9 @@ def get_host():
     from lab import context, run_aws
 
     try:
-        resources = json.loads(RES.read_text(encoding="utf-8"))
-        live = [row for row in resources["rounds"]
-                if row.get("instance", {}).get("state") != "terminated"]
-        instance_id = live[-1]["instance"]["id"]
+        from resources import load_deployment_target
+        target = load_deployment_target(RES)
+        instance_id = target["instance_id"]
         row = run_aws(["ec2", "describe-instances", "--instance-ids", instance_id,
                        "--query", "Reservations[0].Instances[0].{S:State.Name,P:PublicIpAddress}"],
                       context()["region"])
@@ -141,8 +140,10 @@ def main():
                 key_name, value = line.split("=", 1)
                 config_values[key_name.strip()] = value.strip()
     owner = config_values.get("OWNER", "")
-    key_path = Path.home() / ".ssh" / f"w03-{owner}-key" if owner else None
-    key = str(key_path) if key_path and key_path.is_file() and not key_path.is_symlink() else None
+    from resources import load_deployment_target
+    target = load_deployment_target(RES)
+    key_path = Path.home() / ".ssh" / target["key_name"]
+    key = str(key_path) if key_path.is_file() and not key_path.is_symlink() else None
     if key:
         restart = subprocess.run(
             ["ssh", "-i", key, "-o", "StrictHostKeyChecking=accept-new",
@@ -152,9 +153,21 @@ def main():
     else:
         restart = None
     if restart is not None and restart.returncode == 0:
-        time.sleep(2)
-        code, body = curl_json(f"{base}/events/{event_id}",
-                               headers={"Authorization": f"Bearer {operator}"})
+        ready = False
+        for _ in range(15):
+            status, health_after = curl_json(f"{base}/health", timeout=2)
+            if status == 200 and health_after.get("db_configured") is True:
+                ready = True
+                break
+            time.sleep(2)
+
+        if ready:
+            code, body = curl_json(
+                f"{base}/events/{event_id}",
+                headers={"Authorization": f"Bearer {operator}"}
+            )
+        else:
+            code, body = 0, {}
     else:
         code, body = 0, {}
     record(4, "GET after service restart", 200, code, body,
