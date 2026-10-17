@@ -61,6 +61,36 @@ class ResourceLedgerTests(unittest.TestCase):
 
 
 
+
+class W5SubnetSelectionTests(unittest.TestCase):
+    def test_selects_nonoverlapping_subnets_in_different_azs(self):
+        existing = [
+            {"CidrBlock": "172.31.0.0/20", "AvailabilityZone": "us-east-1a"},
+            {"CidrBlock": "172.31.16.0/20", "AvailabilityZone": "us-east-1b"},
+        ]
+
+        def fake_run_aws(args, region):
+            self.assertEqual(args[:2], ["ec2", "describe-subnets"])
+            return {"Subnets": existing}
+
+        def fake_describe_one(service, args, region, key):
+            return {"CidrBlock": "172.31.0.0/16"}
+
+        with mock.patch.object(db_up, "run_aws", side_effect=fake_run_aws), \
+             mock.patch.object(db_up, "describe_one", side_effect=fake_describe_one):
+            result = db_up.choose_private_subnets(
+                "us-east-1",
+                "vpc-test",
+                [s["CidrBlock"] for s in existing],
+                [s["AvailabilityZone"] for s in existing],
+            )
+
+        self.assertEqual(len(result), 2)
+        self.assertNotEqual(result[0][1], result[1][1])
+        self.assertEqual(result[0][0], "172.31.32.0/24")
+        self.assertEqual(result[1][0], "172.31.33.0/24")
+
+
 class W5RdsLookupTests(unittest.TestCase):
     def test_missing_rds_returns_none(self):
         with mock.patch.object(

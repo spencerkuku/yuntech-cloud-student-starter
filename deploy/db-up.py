@@ -106,7 +106,7 @@ def recorded_rds_identifier(w5_resources, expected_identifier):
 
 def choose_private_subnets(region, vpc_id, used_cidrs, azs):
     existing = run_aws(['ec2', 'describe-subnets', '--filters', f'Name=vpc-id,Values={vpc_id}'], region)['Subnets']
-    networks = [ipaddress.ip_network(item['CidrBlock']) for item in used_cidrs]
+    networks = [ipaddress.ip_network(item) for item in used_cidrs]
     candidates = []
     vpc = describe_one('ec2', ['describe-vpcs', '--vpc-ids', vpc_id], region, 'Vpcs')
     vpc_net = ipaddress.ip_network(vpc['CidrBlock'])
