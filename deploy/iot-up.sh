@@ -338,7 +338,7 @@ def ensure_policy(kind, account):
         stop(f"Resource ledger entry {ledger_key} conflicts with the expected policy name")
 
     expected = make_policy(kind, account)
-    known = run_aws(["iot", "list-policies", "--scope", "Local"], REGION)
+    known = run_aws(["iot", "list-policies"], REGION)
     existing = any(item.get("policyName") == name for item in known.get("policies", []))
     if existing:
         current = run_aws(["iot", "get-policy", "--policy-name", name], REGION)
