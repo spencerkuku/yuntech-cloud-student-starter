@@ -1,0 +1,5 @@
+{
+  "api_base_url": "https://your-group-api.example.invalid",
+  "expected_device_id": "g03-cam01",
+  "ca_file": "w09-api-ca.pem"
+}

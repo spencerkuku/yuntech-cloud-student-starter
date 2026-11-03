@@ -182,7 +182,13 @@
     "third-party/AWS-Agent-Toolkit-LICENSE",
     "third-party/AWS-Agent-Toolkit-NOTICE",
     "third-party/README.md",
-    "third-party/aws-skills.lock.json"
+    "third-party/aws-skills.lock.json",
+    "labs/09-edge-cloud/config.example.json",
+    "labs/09-edge-cloud/README.md",
+    "tools/requirements-w09.txt",
+    "tools/w09_build.ps1",
+    "tools/w09_check.py",
+    "tools/w09_check_README.md"
   ],
   "purpose": "Explicit starter file allowlist; no teacher history"
 }
