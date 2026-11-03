@@ -12,3 +12,6 @@
 | W4：第一筆事件可送入、查詢並顯示 | [Sprint 任務](labs/04-web-api/README.md) |
 | W5：重啟不丟資料、重送不重複新增 | [Sprint 任務](labs/05-private-rds/README.md) |
 | W6：多個模擬設備回報與設備篩選 | [Sprint 任務](labs/06-iot/README.md) |
+| W9：小組警報事件與照片上雲 | [課堂任務與三項現場查核](labs/09-edge-cloud/README.md) |
+
+W9 由小組在課堂完成，請助教現場查核新事件、當次照片與持續警報不新增；不繳交報告、截圖或測試輸出。
